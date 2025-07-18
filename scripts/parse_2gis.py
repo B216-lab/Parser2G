@@ -2,10 +2,10 @@ import json
 import logging
 import traceback
 
-from parsers.twogis.twogis_parser import TwoGisParser
+from src.parsers.twogis.twogis_parser import TwoGisParser
 from scripts.preprocessing import preprocess
-from db_scripts.gets.get_addresses_db import get_addresses_by_district
-from db_scripts.writes.write_build_orgs_db import save_data_to_db
+from src.database.db_scripts.gets.get_addresses_db import get_addresses_by_district
+from src.database.db_scripts.writes.write_build_orgs_db import save_data_to_db
 
 
 # Настройка логгера

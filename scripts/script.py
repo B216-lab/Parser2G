@@ -1,10 +1,9 @@
 import json
-import os
 import concurrent.futures
 
-from parsers.dadata.suggestion import DadataSuggestion
-from parsers.twogis.twogis_parser import TwoGisParser
-from parsers.minzhkh.minzhkh_parser import MinzhkhParser
+from src.parsers.dadata.suggestion import DadataSuggestion
+from src.parsers.twogis.twogis_parser import TwoGisParser
+from src.parsers.minzhkh.minzhkh_parser import MinzhkhParser
 from scripts.preprocessing import preprocess
 
 def load_addresses_from_file(filepath):

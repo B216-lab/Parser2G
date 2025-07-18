@@ -15,11 +15,4 @@
 .env
 
 # Игнорировать содержимое папок:
-data/*
-
-#!data_clean/processed_data/.gitkeep
-#!data_clean/export_data/.gitkeep
-#!data/2gis/.gitkeep
-#!data/osm/addresses_districts/.gitkeep
-#!data/osm/all_addresses/.gitkeep
-#!data/osm/districts/.gitkeep
+data/temp
