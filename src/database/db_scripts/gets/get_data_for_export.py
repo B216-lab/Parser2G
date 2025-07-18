@@ -187,7 +187,7 @@ def export_data(filepath, format):
 if __name__ == "__main__":
     data = fetch_all_addresses()
     print(data[:3])
-    save_addresses_to_csv(data, "../../../../data/all_addresses.csv")
+    save_addresses_to_csv(data, "../../../../dat/all_addresses.csv")
 
     # merged_data = fetch_buildings_and_organizations()
     # save_to_json(merged_data, "../../data/buildings_with_organizations.json")

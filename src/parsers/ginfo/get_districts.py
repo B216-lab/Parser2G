@@ -4,7 +4,7 @@ import json
 
 BASE_URL = "https://irkutsk.ginfo.ru"
 START_URL = f"{BASE_URL}"
-OUTPUT_FILE = "../../../data/ginfo/irkutsk_districts.json"
+OUTPUT_FILE = "../../../dat/ginfo/irkutsk_districts.json"
 
 headers = {
     "User-Agent": "Mozilla/5.0"

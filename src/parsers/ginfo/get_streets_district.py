@@ -78,7 +78,7 @@ def get_street_links(district_url, log_func, mock=False):
 def get_streets_mock(log_func):
     try:
         streets = []
-        with open("../../../data/ginfo/irkutsk_streets_октябрьский.json", "r", encoding="utf-8") as f:
+        with open("../../../dat/ginfo/irkutsk_streets_октябрьский.json", "r", encoding="utf-8") as f:
             streets = json.load(f)
 
         for idx, street in enumerate(streets, start=1):

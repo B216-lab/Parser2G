@@ -89,7 +89,7 @@ def get_addresses(streets, log_func, mock=False):
 def get_addresses_mock(log_func):
     try:
         addresses = []
-        with open("../../../data/ginfo/irkutsk_houses_coords_октябрьский.json", "r", encoding="utf-8") as f:
+        with open("../../../dat/ginfo/irkutsk_houses_coords_октябрьский.json", "r", encoding="utf-8") as f:
             addresses = json.load(f)
 
         for i, address in enumerate(addresses, 1):

@@ -16,6 +16,6 @@
 
 # Игнорировать содержимое папок:
 data/
+data/temp
 !data/.gitkeep
-data/temp/
 !data/temp/.gitkeep
