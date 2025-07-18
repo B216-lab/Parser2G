@@ -15,4 +15,7 @@
 .env
 
 # Игнорировать содержимое папок:
-data/temp
+data/
+!data/.gitkeep
+data/temp/
+!data/temp/.gitkeep
