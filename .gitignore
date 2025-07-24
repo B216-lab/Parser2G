@@ -19,3 +19,6 @@ data/
 data/temp
 !data/.gitkeep
 !data/temp/.gitkeep
+
+# Игнорировать pycache
+*pycache
