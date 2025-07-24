@@ -9,7 +9,8 @@ headers = {
 }
 
 class GinfoParser:
-    def __init__(self, base_url='https://irkutsk.ginfo.ru'):
+    def __init__(self, log, base_url='https://irkutsk.ginfo.ru'):
+        self.log = log
         self.BASE_URL = base_url
 
     # --- Извлечение районов ---
@@ -24,13 +25,14 @@ class GinfoParser:
             list {name, url}: Список словарей с информацией о районах (имя и URL).
         """
         try:
+            self.log("Запущен парсинг районов")
             response = requests.get(self.BASE_URL, headers=headers, timeout=10,  verify=False)
             response.raise_for_status()
             soup = BeautifulSoup(response.text, "html.parser")
 
             main_block = soup.find("div", class_="main_block")
             if not main_block:
-                print('Не найден блок с районами')
+                self.log('Не найден блок с районами')
                 return
 
             district_links = []
@@ -44,12 +46,12 @@ class GinfoParser:
                 name = a.text.strip()
                 url = self.BASE_URL + a["href"]
                 districts.append({"name": name, "url": url})
-                print(f"[{idx}] Извлечен район: {name}")
+                self.log(f"[{idx}] Найден район: {name}")
             self.save_to_temp('districts', districts)  # Сохраняем в файл
-            return districts
+            self.log(f"Найдено районов: {len(districts)}")
 
         except Exception as e:
-            print(f"Ошибка при получении районов: {e}")
+            self.log(f"Ошибка при получении районов: {e}")
             return
 
     # --- Извлечение улиц ---
@@ -91,11 +93,11 @@ class GinfoParser:
                     if street_data:
                         self.save_to_temp('streets', [street_data], append=True)
                         streets.append(street_data)
-                        print(f"[{idx}] Извлечена улица: {street_data.get('name')}")
+                        self.log(f"[{idx}] Извлечена улица: {street_data.get('name')}")
             return streets
 
         except Exception as e:
-            print(f"Ошибка при получении списка улиц: {e}")
+            self.log(f"Ошибка при получении списка улиц: {e}")
             return []
         
     def __parse_street_info(self, street_url):
@@ -166,7 +168,7 @@ class GinfoParser:
             }
         
         except Exception as e:
-            print(f"Ошибка при парсинге страницы улицы {street_url}: {e}")
+            self.log(f"Ошибка при парсинге страницы улицы {street_url}: {e}")
             return        
 
     def save_to_temp(self, name_file, data, append=False):
@@ -191,7 +193,7 @@ class GinfoParser:
             with open(temp_file, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=4)
         except Exception as e:
-            print(f'Ошибка при сохранении данных: {e}')
+            self.log(f'Ошибка при сохранении данных: {e}')
             
     def clear_temp_file(self, name_file):
         """
@@ -203,9 +205,9 @@ class GinfoParser:
         try:
             with open(temp_file, 'w', encoding='utf-8') as f:
                 json.dump([], f, ensure_ascii=False, indent=4)
-            print(f'Файл {temp_file} очищен.')
+            self.log(f'Файл {temp_file} очищен.')
         except Exception as e:
-            print(f'Ошибка при очистке файла: {e}')
+            self.log(f'Ошибка при очистке файла: {e}')
 
 if __name__ == "__main__":
     ginfo_parser = GinfoParser()
@@ -214,6 +216,6 @@ if __name__ == "__main__":
     
     for district in districts:
         ginfo_parser.get_streets(district['url'])
-    print(districts[1]['url'])
+    self.log(districts[1]['url'])
     
     
