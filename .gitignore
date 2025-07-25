@@ -15,10 +15,26 @@
 .env
 
 # Игнорировать содержимое папок:
+__pychache__/
+dist/
+build/
+venv/
+.venv/
+
 data/
 data/temp
 !data/.gitkeep
 !data/temp/.gitkeep
 
-# Игнорировать pycache
-*pycache
+*.py[cod]
+*.so
+*.pyc
+*.pyo
+*.swp
+*.swo
+*.lock
+*.egg-info/
+.env.local
+*.sqlite3
+*.db
+*.toml

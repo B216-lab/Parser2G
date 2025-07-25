@@ -2,17 +2,22 @@ from parsers.ginfo.ginfo_parser import GinfoParser
 import os
 import json
 
+
 class ParsingAddresses:
     def __init__(self, log):
         self.parser = GinfoParser(log=log)
         self.log = log
+        
+        self.districts = None
+        self.streets_district = None
+        self.addresses_street = None
         
         self.count_districts = 0
         self.count_streets = 0
         self.count_addresses = 0
 
     def parse_districts(self):
-        self.parser.get_districts()
+        self.districts = self.parser.get_districts()
         self.update_counters()
         
     def _parse_street_district(self, district_url):
