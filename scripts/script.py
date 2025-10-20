@@ -1,9 +1,14 @@
+import sys
+import os
 import json
 import concurrent.futures
 
-from src.parsers.dadata.suggestion import DadataSuggestion
-from src.parsers.twogis.twogis_parser import TwoGisParser
-from src.parsers.minzhkh.minzhkh_parser import MinzhkhParser
+# Добавляем корневую директорию в путь Python
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
+# Теперь импортируем модули
+from src.parsers.twogis import TwoGisParser
+from src.parsers.minzhkh import MinzhkhParser
 from scripts.preprocessing import preprocess
 
 def load_addresses_from_file(filepath):
@@ -14,6 +19,7 @@ def load_addresses_from_file(filepath):
             return out_addresses
     except FileNotFoundError as fe:
         print("❌ Ошибка, файл с адресами не найден!", fe)
+        return []
 
 def save_json(data, filename):
     with open(filename, "w", encoding="utf-8") as f:
@@ -38,39 +44,53 @@ def parse_minzhkh(address, parser: MinzhkhParser):
     build_info = parser.get_build()
     return build_info
 
-def parse_dadata(address, parser: DadataSuggestion):
-    address_info = parser.process_address(address)
-    return address_info
+def extract_address_components(address):
+    """Простая функция для извлечения компонентов адреса без Dadata"""
+    components = {
+        'value': address,
+        'city': '',
+        'street': '',
+        'house': ''
+    }
+    
+    parts = address.split(',')
+    if len(parts) >= 1:
+        components['city'] = parts[0].strip()
+    if len(parts) >= 2:
+        components['street'] = parts[1].strip()
+    if len(parts) >= 3:
+        components['house'] = parts[2].strip()
+    
+    return components
 
 if __name__ == "__main__":
-    path_addresses = "../other/test_addresses.txt"
+    # Используем относительные пути от корня проекта
+    path_addresses = os.path.join("other", "test_addresses.txt")
     addresses = load_addresses_from_file(path_addresses)
 
-    output_path = "../data/ready"
+    output_path = "data/ready"
+    os.makedirs(output_path, exist_ok=True)
 
-    dadata = DadataSuggestion()
     parserMinzhkh = MinzhkhParser()
     parserTwogis = TwoGisParser()
 
     for num, address in enumerate(addresses, start=1):
         print(f"\n🔍 Обрабатываем: {address} ({num}/{len(addresses)})")
-        address_data = parse_dadata(address, dadata)
-        address_value = dadata.get_value()
-        address_city = dadata.get_city()
-        address_street = dadata.get_name_street()
-        address_house = dadata.get_house()
+        
+        address_data = extract_address_components(address)
+        address_value = address_data['value']
 
         # Запускаем два парсера в отдельных потоках
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
             future_2gis = executor.submit(parse_2gis, address_value, parserTwogis)
             future_minzhkh = executor.submit(parse_minzhkh, address, parserMinzhkh)
 
-            # Ждём, пока оба завершатся
             build_raw, orgs_raw = future_2gis.result()
             minzhkh_raw = future_minzhkh.result()
 
         output_file = preprocess(address_raw=address_data, build_raw=build_raw, orgs_raw=orgs_raw, minzhkh_raw=minzhkh_raw)
-        save_json(output_file, f"{output_path}/file_{num}.json")
+        output_filename = os.path.join(output_path, f"file_{num}.json")
+        save_json(output_file, output_filename)
 
     print(parserMinzhkh.stats)
     print(parserTwogis.stats)
