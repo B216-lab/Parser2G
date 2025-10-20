@@ -1,0 +1,167 @@
+<!-- templates/index.html -->
+{% extends "base.html" %}
+
+{% block content %}
+<div class="row">
+  <div class="col-md-8">
+    <h4>Парсинг</h4>
+    <form method="post" action="{{ url_for('start_session') }}">
+      <button class="btn btn-primary mb-2">Создать новую временную сессию</button>
+    </form>
+
+    <div class="card mb-3">
+      <div class="card-body">
+        <h5 class="card-title">Действия с сессией</h5>
+        {% if sessions %}
+          <table class="table table-sm">
+            <thead><tr><th>Session ID</th><th>DB файл</th><th>Действия</th></tr></thead>
+            <tbody>
+              {% for s in sessions %}
+              <tr>
+                <td style="word-break:break-all">{{ s.id }}</td>
+                <td style="word-break:break-all">{{ s.path }}</td>
+                <td>
+                  <!-- парсинг районов (sync) -->
+                  <form style="display:inline" method="post" action="{{ url_for('parse_districts', session_id=s.id) }}">
+                    <div class="input-group input-group-sm" style="min-width:420px;">
+                      <input name="ginfo_url"
+                             class="form-control form-control-sm"
+                             placeholder="пример: irkutsk.ginfo.ru или https://irkutsk.ginfo.ru"
+                             value="{{ s.ginfo_url or fallback_ginfo or '' }}">
+                      <button class="btn btn-outline-primary btn-sm">Парсить районы</button>
+                    </div>
+                  </form>
+
+                  <!-- парсинг улиц (sync) -->
+                  <form style="display:inline" method="post" action="{{ url_for('parse_streets', session_id=s.id) }}">
+                    <button class="btn btn-outline-secondary btn-sm ms-1">Парсить улицы</button>
+                  </form>
+
+                  <!-- фоновые парсинги (раздельно) -->
+                  <button class="btn btn-primary btn-sm ms-1" onclick="startBgDistricts('{{ s.id }}', this)">Парсить районы (фон)</button>
+                  <button class="btn btn-secondary btn-sm ms-1" onclick="startBgStreets('{{ s.id }}', this)">Парсить улицы (фон)</button>
+
+                  <a href="{{ url_for('export_csv', session_id=s.id) }}" class="btn btn-outline-success btn-sm ms-1">Экспорт CSV</a>
+
+                  <form style="display:inline" method="post" action="{{ url_for('delete_session', session_id=s.id) }}" class="d-inline">
+                    <button class="btn btn-outline-danger btn-sm ms-1">Удалить</button>
+                  </form>
+
+                  <!-- Progress for districts -->
+                  <div id="progress-districts-{{ s.id }}" class="mt-2" style="display:none;">
+                    <label class="small">Районы</label>
+                    <div class="progress">
+                      <div id="progress-bar-districts-{{ s.id }}" class="progress-bar" role="progressbar" style="width:0%">0%</div>
+                    </div>
+                    <div id="progress-msg-districts-{{ s.id }}" class="small text-muted mt-1"></div>
+                  </div>
+
+                  <!-- Progress for streets -->
+                  <div id="progress-streets-{{ s.id }}" class="mt-2" style="display:none;">
+                    <label class="small">Улицы</label>
+                    <div class="progress">
+                      <div id="progress-bar-streets-{{ s.id }}" class="progress-bar bg-secondary" role="progressbar" style="width:0%">0%</div>
+                    </div>
+                    <div id="progress-msg-streets-{{ s.id }}" class="small text-muted mt-1"></div>
+                  </div>
+
+                </td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        {% else %}
+          <p>Сессий пока нет — создайте новую.</p>
+        {% endif %}
+      </div>
+    </div>
+
+    <h5>Примечания</h5>
+    <ul>
+      <li>Сессия — это отдельный временный файл БД (SQLite) в <code>data/temp/</code>.</li>
+      <li>Кнопки <strong>Парсить районы (фон)</strong> и <strong>Парсить улицы (фон)</strong> запускают отдельные фоновые задачи и отображают прогресс.</li>
+      <li>Если сайт использует JavaScript для наполнения контента, возможно потребуется selenium.</li>
+    </ul>
+  </div>
+
+  <div class="col-md-4">
+    <div class="card">
+      <div class="card-body">
+        <h5 class="card-title">Настройки</h5>
+        <p>Пока здесь базовые опции. </p>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function normalizeResult(json) {
+  return json;
+}
+
+function startBgDistricts(sessionId, btn){
+  btn.disabled = true;
+  const row = btn.closest('tr');
+  const input = row.querySelector('input[name="ginfo_url"]');
+  const ginfo = input ? input.value : '';
+  fetch(`/start_parse_districts_bg/${sessionId}`, {
+    method: 'POST',
+    headers: {'Content-Type':'application/x-www-form-urlencoded'},
+    body: new URLSearchParams({ginfo_url: ginfo})
+  }).then(r=>{
+    if (r.status === 202 || r.ok) {
+      document.getElementById('progress-districts-' + sessionId).style.display = 'block';
+      pollTask(sessionId, 'districts', btn);
+    } else {
+      r.json().then(j=> { alert(JSON.stringify(j)); btn.disabled=false; });
+    }
+  }).catch(e=>{
+    console.error(e);
+    btn.disabled = false;
+  });
+}
+
+function startBgStreets(sessionId, btn){
+  btn.disabled = true;
+  fetch(`/start_parse_streets_bg/${sessionId}`, { method: 'POST' }).then(r=>{
+    if (r.status === 202 || r.ok) {
+      document.getElementById('progress-streets-' + sessionId).style.display = 'block';
+      pollTask(sessionId, 'streets', btn);
+    } else {
+      r.json().then(j=> { alert(JSON.stringify(j)); btn.disabled=false; });
+    }
+  }).catch(e=>{
+    console.error(e);
+    btn.disabled = false;
+  });
+}
+
+function pollTask(sessionId, taskType, btn){
+  fetch(`/task_status/${sessionId}/${taskType}`).then(r=>{
+    if (!r.ok) throw new Error('status ' + r.status);
+    return r.json();
+  }).then(data=>{
+    const pbar = document.getElementById(`progress-bar-${taskType}-${sessionId}`);
+    const msg = document.getElementById(`progress-msg-${taskType}-${sessionId}`);
+    pbar.style.width = (data.progress||0) + '%';
+    pbar.textContent = (data.progress||0) + '%';
+    msg.textContent = data.message || '';
+    if (data.status === 'running' || data.status === 'queued') {
+      setTimeout(()=> pollTask(sessionId, taskType, btn), 800);
+    } else {
+      btn.disabled = false;
+      if (data.status === 'finished') {
+        msg.textContent = data.message || 'Готово';
+      } else if (data.status === 'error') {
+        msg.textContent = 'Ошибка: ' + (data.message || '');
+      }
+    }
+  }).catch(e=>{
+    console.error(e);
+    btn.disabled = false;
+  });
+}
+</script>
+{% endblock %}

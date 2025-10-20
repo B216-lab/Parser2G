@@ -1,6 +1,6 @@
 # Игнорировать все JSON-файлы
 *.json
-
+*.pyc
 # Игнорировать все TXT файлы, кроме requirements(список библиотек)
 *.txt
 !requirements.txt
