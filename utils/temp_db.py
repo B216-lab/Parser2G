@@ -52,6 +52,16 @@ def create_temp_db(path: str):
             FOREIGN KEY(street_id) REFERENCES streets(id)
         )
     """)
+    # Новая таблица для организаций / найденных сущностей 2GIS
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS organizations(
+            id INTEGER PRIMARY KEY,
+            building_id INTEGER,
+            name TEXT,
+            raw_json TEXT,
+            FOREIGN KEY(building_id) REFERENCES buildings(id)
+        )
+    """)
     conn.commit()
     conn.close()
 
