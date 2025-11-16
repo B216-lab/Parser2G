@@ -13,7 +13,8 @@ from flask import Flask, request, jsonify, render_template, redirect, url_for, f
 # Логика (убедитесь, что эти модули есть в проекте)
 from logic.parsing_addresses import ParsingAddressesManager
 from logic.two_gis_cli import TwoGisCliParser
-from logic.playwright_extractor import run_extract_ids
+from logic.playwright_extractor import extract_ids_to_db
+
 
 # --- Конфигурация ---
 # Поменяйте при необходимости на ваш реальный путь (например "G:/Rab Stol/Parser2GISNew/data/temp")
@@ -453,40 +454,35 @@ def start_parse_2gis_bg(session_id):
 
 @app.route("/start_extract_ids_bg/<session_id>", methods=["POST"])
 def start_extract_ids_bg(session_id):
-    dbp = ensure_temp_db(session_id)
-    city = request.form.get("city") or None
+    dbp = ensure_temp_db(session_id)  # используйте вашу функцию для получения path
+    # читаем параметры из формы (JS может их отправлять)
     headless = request.form.get("headless", "false").lower() in ("1", "true", "yes")
-    try:
-        delay = float(request.form.get("delay", 0.6))
-    except Exception:
-        delay = 0.6
-    try:
-        limit = int(request.form.get("limit", 0))
-    except Exception:
-        limit = 0
-    try:
-        timeout_ms = int(request.form.get("timeout_ms", 12000))
-    except Exception:
-        timeout_ms = 12000
-
-    screenshots_dir = str(Path(TEMP_ROOT) / "playwright_screens")
+    concurrency = int(request.form.get("concurrency", 10))
+    delay = float(request.form.get("delay", 0.6))
+    limit = int(request.form.get("limit", 50))
 
     def target(progress_callback=None):
-        run_extract_ids(
-            str(dbp),
-            city_override=city,
-            headless=headless,
-            delay=delay,
-            limit=limit,
-            timeout_ms=timeout_ms,
-            screenshots_dir=screenshots_dir,
-            progress_callback=progress_callback
+        # Мы запускаем async extractor в этом фоновом потоке
+        import asyncio
+        # Запускаем корутину
+        res = asyncio.run(
+            extract_ids_to_db(
+                str(dbp),
+                headless=headless,
+                concurrency=concurrency,
+                delay=delay,
+                limit=limit,
+                log=app.logger.info,
+                progress_callback=progress_callback
+            )
         )
+        return res
 
     ok, msg = _start_background_task(session_id, "extract_ids", target)
     if not ok:
         return jsonify({"error": msg}), 409
     return jsonify({"status": "started"}), 202
+
 
 
 # ---------- Task status ----------

@@ -1,280 +1,307 @@
 # logic/playwright_extractor.py
-from pathlib import Path
+import asyncio
 import sqlite3
 import json
 import re
-import time
-from typing import Optional, Any, Callable, Dict
+from pathlib import Path
+from urllib.parse import quote_plus
+from typing import Optional, Callable, List, Tuple, Dict, Any
 
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+# playwright async API
+from playwright.async_api import async_playwright, Page, Browser, TimeoutError as PlaywrightTimeoutError
 
-GEO_RE = re.compile(r"/geo/(\d+)(?:/|\?|$)")
-FALLBACK_DIGIT_RE = re.compile(r"\b(\d{9,20})\b")
+# Helper: run blocking DB code in thread
+async def _run_db(fn, *args, **kwargs):
+    return await asyncio.to_thread(fn, *args, **kwargs)
 
 
-def _extract_geo_from_text(text: str) -> Optional[str]:
-    if not text:
+def _fetch_rows_sync(db_path: str, limit: int = 0) -> List[Tuple]:
+    """
+    Возвращает список записей, которые нужно обработать:
+    (building_id, address, street_name, city_name, ginfo_url)
+    Фильтр: dgis_id IS NULL OR dgis_id == ''
+    Ordered by city/district/street/id
+    """
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    q = """
+    SELECT b.id, COALESCE(b.address, ''), COALESCE(s.name, ''), COALESCE(c.name, ''), COALESCE(c.ginfo_url, '')
+    FROM buildings b
+    LEFT JOIN streets s ON b.street_id = s.id
+    LEFT JOIN districts d ON s.district_id = d.id
+    LEFT JOIN cities c ON d.city_id = c.id
+    WHERE b.dgis_id IS NULL OR b.dgis_id = ''
+    ORDER BY c.name, d.name, s.name, b.id
+    """
+    if limit and limit > 0:
+        q += f" LIMIT {int(limit)}"
+    cur.execute(q)
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def _write_dgis_id_sync(db_path: str, building_id: int, dgis_id: str):
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("UPDATE buildings SET dgis_id = ? WHERE id = ?", (dgis_id, building_id))
+    conn.commit()
+    conn.close()
+
+
+def _mark_failed_sync(db_path: str, building_id: int):
+    # Помечаем пустым raw_json чтобы не зациклиться — но можно адаптировать
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("UPDATE buildings SET raw_json = ? WHERE id = ?", ("", building_id))
+    conn.commit()
+    conn.close()
+
+
+def guess_city_from_ginfo(ginfo_url: str) -> Optional[str]:
+    if not ginfo_url:
         return None
-    m = GEO_RE.search(text)
+    try:
+        host = ginfo_url.split("://", 1)[-1].split("/")[0]
+        return host.split(".")[0]
+    except Exception:
+        return None
+
+
+def build_search_query(city: str, street: str, address: str) -> str:
+    # В отличие от синхронной версии, не включаем город в поисковый запрос
+    # так как он уже будет в URL
+    parts = []
+    if street:
+        parts.append(street)
+    if address:
+        parts.append(address)
+    query = " ".join([p for p in parts if p])
+    return query
+
+
+def extract_id_from_url(url: str) -> Optional[str]:
+    if not url:
+        return None
+    m = re.search(r"/(?:inside|geo)/([0-9A-Za-z_%-]+)", url)
     if m:
         return m.group(1)
-    m2 = FALLBACK_DIGIT_RE.search(text)
-    if m2:
-        return m2.group(1)
     return None
 
 
-def _find_geo_in_obj(obj: Any) -> Optional[str]:
-    if obj is None:
+async def _process_one(page: Page, url: str, timeout: int = 20000, log: Callable[[str], None] = print) -> Optional[str]:
+    """
+    Навигация к url (search URL), попытаемся дождаться результатов и получить page.url(),
+    извлечь id (inside|geo). Возвращаем найденный id или None.
+    """
+    try:
+        await page.goto(url, timeout=timeout)
+    except PlaywrightTimeoutError:
+        log(f"Playwright: timeout loading {url}")
         return None
-    if isinstance(obj, str):
-        return _extract_geo_from_text(obj)
-    if isinstance(obj, (int, float)):
+    except Exception as e:
+        log(f"Playwright: error loading {url}: {e}")
         return None
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            if isinstance(k, str):
-                r = _extract_geo_from_text(k)
-                if r:
-                    return r
-            r2 = _find_geo_in_obj(v)
-            if r2:
-                return r2
-        return None
-    if isinstance(obj, list):
-        for it in obj:
-            r = _find_geo_in_obj(it)
-            if r:
-                return r
-        return None
+
+    # Ждем загрузки состояния networkidle для обеспечения полной загрузки страницы
+    try:
+        await page.wait_for_load_state("networkidle", timeout=10000)
+    except PlaywrightTimeoutError:
+        # продолжаем работу, даже если не достигнуто networkidle
+        pass
+
+    # Если после перехода url уже содержит inside/geo -> сразу вернём
+    cur = page.url
+    found = extract_id_from_url(cur)
+    if found:
+        return found
+
+    # Попробуем кликнуть первый результат (несколько стратегий)
+    selectors_to_try = [
+        "a[href*='/inside/']",
+        "a[href*='/geo/']",
+        "a.search-result__link",        # возможный селектор результатов
+        "a.search-item__link",          # запасной
+        ".searchResults a",             # общий запасной
+        "a",                            # fallback: первый <a>
+    ]
+    for sel in selectors_to_try:
+        try:
+            # wait_for_selector с небольшим timeout
+            el = await page.query_selector(sel)
+            if el:
+                try:
+                    await el.click(timeout=5000)
+                    # подождать навигацию/idle
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=8000)
+                    except PlaywrightTimeoutError:
+                        # игнорируем — просто проверим URL
+                        pass
+                    cur = page.url
+                    found = extract_id_from_url(cur)
+                    if found:
+                        return found
+                except Exception:
+                    # если click не сработал — попытаемся получить href из элемента
+                    try:
+                        href = await el.get_attribute("href")
+                        if href:
+                            found = extract_id_from_url(href)
+                            if found:
+                                return found
+                    except Exception:
+                        pass
+        except Exception:
+            continue
+
+    # как последний вариант — ищем ссылки на странице и пробуем их href
+    try:
+        anchors = await page.query_selector_all("a")
+        for a in anchors[:30]:  # не перебираем слишком много
+            try:
+                href = await a.get_attribute("href")
+                if href:
+                    found = extract_id_from_url(href)
+                    if found:
+                        return found
+            except Exception:
+                continue
+    except Exception:
+        pass
+
     return None
 
 
-def _ensure_dgis_column(conn: sqlite3.Connection):
-    cur = conn.cursor()
-    cur.execute("PRAGMA table_info(buildings)")
-    cols = [r[1] for r in cur.fetchall()]
-    if "dgis_id" not in cols:
-        cur.execute("ALTER TABLE buildings ADD COLUMN dgis_id TEXT")
-        conn.commit()
-
-
-def _build_search_url(city: str, street: str, address: str) -> str:
-    from urllib.parse import quote_plus
-    q = f"{street} {address}".strip()
-    return f"https://2gis.ru/{quote_plus(city)}/search/{quote_plus(q)}"
-
-
-def run_extract_ids(
+async def extract_ids_to_db(
     db_path: str,
     *,
-    city_override: Optional[str] = None,
-    headless: bool = False,              # по опыту: по умолчанию False (видимый), чтобы меньше детектов робота
+    headless: bool = False,
+    concurrency: int = 10,
     delay: float = 0.6,
     limit: int = 0,
-    timeout_ms: int = 12000,
-    screenshots_dir: Optional[str] = None,
-    progress_callback: Optional[Callable[[int, str, Dict[str,int]], None]] = None,
-) -> Dict[str,int]:
+    log: Callable[[str], None] = print,
+    progress_callback: Optional[Callable[[int, str, Dict[str, int]], None]] = None,
+    city: Optional[str] = None
+) -> Dict[str, Any]:
     """
-    Основная функция для извлечения dgis_id и записи в таблицу buildings.dgis_id.
+    Асинхронный extractor, который запускает несколько страниц в одном браузере.
 
-    Аргументы:
-      db_path - путь к sqlite (строка)
-      city_override - если указан, используется вместо города из DB
-      headless - True или False (рекомендуется False для надёжности)
-      delay - пауза между запросами (сек)
-      limit - ограничение по кол-ву записей (0 = все)
-      timeout_ms - timeout для загрузки страниц (ms)
-      screenshots_dir - если указан, сохраняет скриншоты ошибок
-      progress_callback(percent:int, message:str, counts:dict) - optional callback
+    Параметры:
+      - db_path: путь к sqlite db (session db)
+      - headless: True/False
+      - concurrency: число параллельных страниц (windows)
+      - delay: задержка между запросами на одной странице (сек)
+      - limit: максимум обрабатываемых записей (0 = без лимита)
+      - log: callable(str) — куда писать логи
+      - progress_callback(percent:int, message:str, counts:dict) — опционально
+      - city: название города для поиска (переопределяет город из базы)
 
-    Возвращает статистику: dict {checked, updated, not_found}
+    Возвращает статистику: { total, processed, success, errors }
     """
-    db_p = Path(db_path)
-    if not db_p.exists():
-        raise FileNotFoundError(f"DB not found: {db_path}")
+    # 1) загрузим список задач (в отдельном потоке)
+    rows = await _run_db(_fetch_rows_sync, db_path, limit)
+    total = len(rows)
+    if total == 0:
+        if progress_callback:
+            progress_callback(100, "No addresses to process", {"total": 0, "processed": 0, "success": 0, "errors": 0})
+        return {"total": 0, "processed": 0, "success": 0, "errors": 0}
 
-    screenshots_dir_p = Path(screenshots_dir) if screenshots_dir else None
-    if screenshots_dir_p:
-        screenshots_dir_p.mkdir(parents=True, exist_ok=True)
+    # build tasks list: list of (id, address, street, city, ginfo_url)
+    tasks_list = []
+    for (b_id, address, street, city_db, ginfo_url) in rows:
+        city_for = city or city_db or guess_city_from_ginfo(ginfo_url) or ""
+        query = build_search_query(city_for, street, address)
+        tasks_list.append((b_id, query, city_for))
 
-    conn = sqlite3.connect(str(db_p))
-    try:
-        _ensure_dgis_column(conn)
-        cur = conn.cursor()
-        # select rows (dgis_id is null or empty)
-        cur.execute("""
-            SELECT b.id, s.name AS street_name, b.address, c.name AS city_name, b.raw_json
-            FROM buildings b
-            JOIN streets s ON b.street_id = s.id
-            JOIN districts d ON s.district_id = d.id
-            JOIN cities c ON d.city_id = c.id
-            WHERE b.dgis_id IS NULL OR b.dgis_id = ''
-            ORDER BY c.name, d.name, s.name
-        """)
-        rows = []
-        # соберём rows в список (можно ещё читать пачками; но для UI задач это нормально)
-        fetch_size = 1000
-        while True:
-            batch = cur.fetchmany(fetch_size)
-            if not batch:
-                break
-            rows.extend(batch)
-        total = len(rows)
-        if total == 0:
-            if progress_callback:
-                progress_callback(100, "Нет зданий для извлечения id", {"total": 0})
-            return {"checked": 0, "updated": 0, "not_found": 0}
+    processed = 0
+    success = 0
+    errors = 0
 
-        checked = 0
-        updated = 0
-        not_found = 0
+    # internal queue for tasks
+    q: asyncio.Queue = asyncio.Queue()
+    for item in tasks_list:
+        await q.put(item)
 
-        # Playwright
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=headless)
-            context = browser.new_context(viewport={"width": 1200, "height": 900})
-            page = context.new_page()
+    # worker coroutine
+    async def worker_task(name: str, browser: Browser):
+        nonlocal processed, success, errors
+        page = await browser.new_page()
+        # set viewport / user agent to look real-ish (you can tweak)
+        await page.set_viewport_size({"width": 1280, "height": 800})
+        await page.set_extra_http_headers({"Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"})
+        # optional: user agent
+        try:
+            await page.set_user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        except Exception:
+            pass
 
+        while not q.empty():
             try:
-                for idx, row in enumerate(rows, start=1):
-                    b_id, street, address, city_db, raw_json = row
-                    checked += 1
-                    city = (city_override or city_db or "irkutsk")
-                    search_url = _build_search_url(city, street, address)
-
-                    # progress
-                    if progress_callback:
-                        pct = int((idx-1) / max(1, total) * 100)
-                        progress_callback(pct, f"Обрабатываю {idx}/{total}: {street} {address}", {"checked": checked, "updated": updated, "not_found": not_found, "total": total})
-
-                    # 0) попробовать raw_json
-                    found = None
-                    if raw_json:
-                        try:
-                            parsed = json.loads(raw_json)
-                        except Exception:
-                            parsed = raw_json
-                        found = _find_geo_in_obj(parsed)
-
-                    if not found:
-                        # 1) открыть search_url и попытаться узнать id
-                        try:
-                            try:
-                                page.goto(search_url, timeout=timeout_ms)
-                            except PlaywrightTimeoutError:
-                                # продолжим — возможно частичный контент уже доступен
-                                pass
-                            try:
-                                page.wait_for_load_state("networkidle", timeout=3000)
-                            except PlaywrightTimeoutError:
-                                pass
-
-                            # сначала прямые ссылки
-                            anchors = page.query_selector_all("a[href*='/geo/']")
-                            if anchors:
-                                href = anchors[0].get_attribute("href")
-                                found = _extract_geo_from_text(href) if href else None
-
-                            # если не найдено — кликаем первый результат
-                            if not found:
-                                selectors_to_try = [
-                                    "a[href*='/geo/']",
-                                    "div.search-result a",
-                                    "div.search-list a",
-                                    "div.result a",
-                                    "a.link",
-                                    "div.card a",
-                                    "div[data-result] a",
-                                ]
-                                for sel in selectors_to_try:
-                                    try:
-                                        locator = page.locator(sel).first
-                                        if not locator:
-                                            continue
-                                        try:
-                                            locator.wait_for(state="visible", timeout=1500)
-                                        except PlaywrightTimeoutError:
-                                            continue
-                                        try:
-                                            locator.click(timeout=2000)
-                                        except Exception:
-                                            # fallback js-click
-                                            handle = locator.element_handle()
-                                            if handle:
-                                                page.evaluate("(el) => el.click()", handle)
-                                        # ждём либо смены url с /geo/, либо появления ссылок
-                                        try:
-                                            page.wait_for_url(re_compile_geo(), timeout=4000)
-                                            cururl = page.url
-                                            found = _extract_geo_from_text(cururl)
-                                        except PlaywrightTimeoutError:
-                                            pass
-
-                                        if not found:
-                                            anchors2 = page.query_selector_all("a[href*='/geo/']")
-                                            if anchors2:
-                                                href2 = anchors2[0].get_attribute("href") or ""
-                                                found = _extract_geo_from_text(href2)
-                                        if found:
-                                            break
-                                    except Exception:
-                                        continue
-                        except Exception as e:
-                            # логирование через callback
-                            if progress_callback:
-                                progress_callback(int((idx-1)/max(1,total)*100), f"Ошибка Playwright: {e}", {"checked": checked, "updated": updated, "not_found": not_found})
-                            # при ошибке сохраняем скриншот (если разрешено)
-                            try:
-                                if screenshots_dir_p:
-                                    out = screenshots_dir_p / f"err_{b_id}_{int(time.time()*1000)}.png"
-                                    page.screenshot(path=str(out), full_page=True)
-                            except Exception:
-                                pass
-
-                    if found:
-                        try:
-                            cur_local = conn.cursor()
-                            cur_local.execute("UPDATE buildings SET dgis_id = ? WHERE id = ?", (str(found), b_id))
-                            conn.commit()
-                            updated += 1
-                        except Exception as e:
-                            # запись упала — не останавливаемся
-                            if progress_callback:
-                                progress_callback(int((idx)/max(1,total)*100), f"Ошибка записи dgis_id для id={b_id}: {e}", {"checked": checked, "updated": updated, "not_found": not_found})
-                    else:
-                        not_found += 1
-
-                    # задержка между запросами
-                    time.sleep(delay)
-
-                    # лимит
-                    if limit and idx >= limit:
-                        break
-
-                    # обновление прогресса
-                    if progress_callback:
-                        pct = int(idx / max(1, total) * 100)
-                        progress_callback(pct, f"Обработано {idx}/{total}", {"checked": checked, "updated": updated, "not_found": not_found, "total": total})
+                b_id, query, city_for = await q.get()
+            except asyncio.CancelledError:
+                break
+            try:
+                search_q = quote_plus(query)
+                url = f"https://2gis.ru/{quote_plus(city_for)}/search/{search_q}"
+                log(f"[worker-{name}] processing id={b_id} query='{query}' -> {url}")
+                # call processing
+                found = await _process_one(page, url, timeout=20000, log=log)
+                if found:
+                    # write to DB in thread
+                    await _run_db(_write_dgis_id_sync, db_path, b_id, found)
+                    success += 1
+                    log(f"[worker-{name}] FOUND id for b_id={b_id}: {found}")
+                else:
+                    # mark failed to avoid endless retries (optional)
+                    await _run_db(_mark_failed_sync, db_path, b_id)
+                    errors += 1
+                    log(f"[worker-{name}] NOT found for b_id={b_id}")
+            except Exception as e:
+                errors += 1
+                log(f"[worker-{name}] Exception for b_id={b_id}: {e}")
+                try:
+                    await _run_db(_mark_failed_sync, db_path, b_id)
+                except Exception:
+                    pass
             finally:
-                try:
-                    page.close()
-                except Exception:
-                    pass
-                try:
-                    context.close()
-                except Exception:
-                    pass
-                try:
-                    browser.close()
-                except Exception:
-                    pass
-    finally:
-        conn.close()
+                processed += 1
+                # progress
+                if progress_callback:
+                    pct = int(processed / max(1, total) * 100)
+                    progress_callback(pct, f"Processed {processed}/{total}", {"total": total, "processed": processed, "success": success, "errors": errors})
+                # polite delay
+                # Убираем задержку при успешной обработке, оставляем только при ошибках
+                if not found:
+                    await asyncio.sleep(delay)
+                q.task_done()
+        try:
+            await page.close()
+        except Exception:
+            pass
 
-    # финальный callback
+    # start playwright and workers
+    try:
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(headless=headless, args=["--no-sandbox"])
+            # create worker tasks
+            workers = min(concurrency, total) if concurrency > 0 else 1
+            log(f"Playwright: launching {workers} worker(s) (headless={headless})")
+            worker_coros = [worker_task(str(i+1), browser) for i in range(workers)]
+            # run workers concurrently
+            await asyncio.gather(*worker_coros)
+            try:
+                await browser.close()
+            except Exception:
+                pass
+    except Exception as e:
+        log(f"Playwright: fatal error: {e}")
+        # if fatal, still return counts
+        if progress_callback:
+            progress_callback(100, f"Error: {e}", {"total": total, "processed": processed, "success": success, "errors": errors})
+        return {"total": total, "processed": processed, "success": success, "errors": errors}
+
+    # done
     if progress_callback:
-        progress_callback(100, "Готово", {"checked": checked, "updated": updated, "not_found": not_found, "total": total})
-
-    return {"checked": checked, "updated": updated, "not_found": not_found, "total": total}
+        progress_callback(100, f"Done. success={success}, errors={errors}", {"total": total, "processed": processed, "success": success, "errors": errors})
+    return {"total": total, "processed": processed, "success": success, "errors": errors}
