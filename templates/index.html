@@ -46,21 +46,26 @@
                   <form style="display:inline" method="post" action="{{ url_for('delete_session', session_id=s.id) }}" class="d-inline">
                     <button class="btn btn-outline-danger btn-sm ms-1">Удалить</button>
                   </form>
-                  <button class="btn btn-info btn-sm ms-1" onclick="startBg2Gis('{{ s.id }}', this)">Парсить 2GIS (фон)</button>
 
                   <!-- NEW: Playwright extract ids -->
-                  <button class="btn btn-outline-primary btn-sm ms-1" onclick="startBgExtractIds('{{ s.id }}', this)">Извлечь ID(Playwright)</button>
+                  <button class="btn btn-outline-primary btn-sm ms-1" onclick="startBgExtractIds('{{ s.id }}', this)">Extract dgis_id (Playwright)</button>
 
-                  <!-- Progress for 2GIS -->
-                  <div id="progress-2gis-{{ s.id }}" class="mt-2" style="display:none;">
-                    <label class="small">2GIS</label>
-                    <div class="progress">
-                      <div id="progress-bar-2gis-{{ s.id }}" class="progress-bar bg-warning" role="progressbar" style="width:0%">0%</div>
+                  <!-- Controls for 2GIS: format selector + button (button last) -->
+                  <div class="d-inline-block ms-2 align-middle">
+                    <div class="input-group input-group-sm" style="min-width:220px;">
+                      <label class="input-group-text" for="format-{{ s.id }}">Формат</label>
+                      <select id="format-{{ s.id }}" class="form-select form-select-sm" aria-label="Выберите формат">
+                        <option value="json" selected>JSON</option>
+                        <option value="csv">CSV</option>
+                      </select>
+                      <!-- optional: batch size small input (hidden for now) -->
                     </div>
-                    <div id="progress-msg-2gis-{{ s.id }}" class="small text-muted mt-1"></div>
                   </div>
 
-                  <!-- Progress for districts -->
+                  <!-- Now the 2GIS button is last (after extract and format) -->
+                  <button class="btn btn-info btn-sm ms-1" onclick="startBg2Gis('{{ s.id }}', this)">Парсить 2GIS (фон)</button>
+
+                  <!-- Progress areas (districts / streets / extract / 2gis) -->
                   <div id="progress-districts-{{ s.id }}" class="mt-2" style="display:none;">
                     <label class="small">Районы</label>
                     <div class="progress">
@@ -69,7 +74,6 @@
                     <div id="progress-msg-districts-{{ s.id }}" class="small text-muted mt-1"></div>
                   </div>
 
-                  <!-- Progress for streets -->
                   <div id="progress-streets-{{ s.id }}" class="mt-2" style="display:none;">
                     <label class="small">Улицы</label>
                     <div class="progress">
@@ -78,13 +82,20 @@
                     <div id="progress-msg-streets-{{ s.id }}" class="small text-muted mt-1"></div>
                   </div>
 
-                  <!-- Progress for extract_ids (Playwright) -->
                   <div id="progress-extract_ids-{{ s.id }}" class="mt-2" style="display:none;">
                     <label class="small">Extract IDs (Playwright)</label>
                     <div class="progress">
                       <div id="progress-bar-extract_ids-{{ s.id }}" class="progress-bar bg-info" role="progressbar" style="width:0%">0%</div>
                     </div>
                     <div id="progress-msg-extract_ids-{{ s.id }}" class="small text-muted mt-1"></div>
+                  </div>
+
+                  <div id="progress-2gis-{{ s.id }}" class="mt-2" style="display:none;">
+                    <label class="small">2GIS</label>
+                    <div class="progress">
+                      <div id="progress-bar-2gis-{{ s.id }}" class="progress-bar bg-warning" role="progressbar" style="width:0%">0%</div>
+                    </div>
+                    <div id="progress-msg-2gis-{{ s.id }}" class="small text-muted mt-1"></div>
                   </div>
 
                 </td>
@@ -101,8 +112,8 @@
     <h5>Примечания</h5>
     <ul>
       <li>Сессия — это отдельный временный файл БД (SQLite) в <code>data/temp/</code>.</li>
-      <li>Кнопки <strong>Парсить районы (фон)</strong> и <strong>Парсить улицы (фон)</strong> запускают отдельные фоновые задачи и отображают прогресс.</li>
-      <li>Если сайт использует JavaScript для наполнения контента, возможно потребуется selenium/playwright.</li>
+      <li>Кнопки <strong>Парсить районы (фон)</strong> и <strong>Парсить улицы (фон)</strong> запускают фоновые задачи и отображают прогресс.</li>
+      <li>Сначала запустите <strong>Extract dgis_id (Playwright)</strong>, дождитесь что `dgis_id` появится в таблице `buildings` — затем запускайте <strong>Парсить 2GIS (фон)</strong> (выберите формат вывода JSON или CSV).</li>
     </ul>
   </div>
 
@@ -119,10 +130,6 @@
 
 {% block scripts %}
 <script>
-function normalizeResult(json) {
-  return json;
-}
-
 function startBgDistricts(sessionId, btn){
   btn.disabled = true;
   const row = btn.closest('tr');
@@ -159,31 +166,9 @@ function startBgStreets(sessionId, btn){
     btn.disabled = false;
   });
 }
-// Запуск 2GIS (фон)
-function startBg2Gis(sessionId, btn){
-  btn.disabled = true;
-  const body = new URLSearchParams({ parser_cmd: "parser-2gis", max_workers: 2 });
-  fetch(`/start_parse_2gis_bg/${sessionId}`, {
-    method: 'POST',
-    headers: {'Content-Type':'application/x-www-form-urlencoded'},
-    body: body
-  }).then(r=>{
-    if (r.status === 202 || r.ok) {
-      document.getElementById('progress-2gis-' + sessionId).style.display = 'block';
-      pollTask(sessionId, '2gis', btn);
-    } else {
-      r.json().then(j=> { alert(JSON.stringify(j)); btn.disabled=false; }).catch(()=> btn.disabled=false);
-    }
-  }).catch(e=>{
-    console.error(e);
-    btn.disabled = false;
-  });
-}
 
-// Функция запуска extract_ids (Playwright)
 function startBgExtractIds(sessionId, btn){
   btn.disabled = true;
-  // default параметры: headless=false (видимый), delay=0.6, limit=0
   const form = new URLSearchParams({
     headless: "false",
     delay: "0.6",
@@ -206,7 +191,36 @@ function startBgExtractIds(sessionId, btn){
   });
 }
 
-// Универсальная поллер-функция (используется и для districts/streets/2gis/extract_ids)
+// Запуск 2GIS (фон) — теперь передаем output_format вместе с parser_cmd и max_workers
+function startBg2Gis(sessionId, btn){
+  btn.disabled = true;
+  const row = btn.closest('tr');
+  const fmt_select = row.querySelector(`#format-${sessionId}`);
+  const output_format = fmt_select ? fmt_select.value : "json";
+  const body = new URLSearchParams({
+    parser_cmd: "parser-2gis",
+    max_workers: 2,
+    output_format: output_format,
+    batch_size: 50
+  });
+  fetch(`/start_parse_2gis_bg/${sessionId}`, {
+    method: 'POST',
+    headers: {'Content-Type':'application/x-www-form-urlencoded'},
+    body: body
+  }).then(r=>{
+    if (r.status === 202 || r.ok) {
+      document.getElementById('progress-2gis-' + sessionId).style.display = 'block';
+      pollTask(sessionId, '2gis', btn);
+    } else {
+      r.json().then(j=> { alert(JSON.stringify(j)); btn.disabled=false; }).catch(()=> btn.disabled=false);
+    }
+  }).catch(e=>{
+    console.error(e);
+    btn.disabled = false;
+  });
+}
+
+// Универсальная pollling функция
 function pollTask(sessionId, taskType, btn){
   fetch(`/task_status/${sessionId}/${taskType}`).then(r=>{
     if (!r.ok) throw new Error('status ' + r.status);

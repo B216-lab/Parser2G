@@ -6,10 +6,17 @@ import time
 import hashlib
 from urllib.parse import quote_plus
 from pathlib import Path
-from typing import Optional, Any
+from typing import Optional, Any, List, Dict
 import shutil
 
+
 class TwoGisCliParser:
+    """
+    Обёртка для CLI parser-2gis.
+
+    - run_cli_once(...) — запуск для одного URL (оставлен для совместимости)
+    - run_batch(city, dgis_ids, ...) — запускает parser-2gis один раз для списка inside-URL'ов.
+    """
     def __init__(self, output_dir: str = None, parser_cmd: str = "parser-2gis",
                  max_retries: int = 2, retry_backoff: float = 1.0, logger=print):
         self.output_dir = Path(output_dir or os.path.join(os.getcwd(), "data", "temp", "2gis_results"))
@@ -19,112 +26,114 @@ class TwoGisCliParser:
         self.retry_backoff = retry_backoff
         self.logger = logger
 
-        # если указали абсолютный путь — используем его, иначе ищем в PATH
-        if Path(self.parser_cmd).exists():
-            self._binary_path = str(Path(self.parser_cmd).resolve())
-        else:
-            self._binary_path = shutil.which(self.parser_cmd)
-
+        # проверим доступность бинаря
+        self._binary_path = shutil.which(self.parser_cmd)
         if not self._binary_path:
-            self.logger(f"TwoGisCliParser: бинарь '{self.parser_cmd}' не найден.")
+            self.logger(f"TwoGisCliParser: не найден бинарь '{self.parser_cmd}' в PATH. Попробуйте указать полный путь.")
         else:
             self.logger(f"TwoGisCliParser: найден бинарь '{self._binary_path}'")
 
-    def _make_outfile(self, city: str, query: str, ext: str):
-        # создаём безопасное имя и возвращаем абсолютный путь
-        q = f"{city} {query}"
-        h = hashlib.sha1(q.encode("utf-8")).hexdigest()[:12]
-        safe = quote_plus(query)[:60]
-        fname = f"{city}_{h}_{safe}.{ext}"
-        return str((self.output_dir / fname).resolve())
+    def _make_outfile(self, city: str, suffix: str = None, ext: str = "json") -> str:
+        # формируем короткое безопасное имя файла: <city>_<sha1>.json
+        stamp = hashlib.sha1(f"{city}:{time.time()}".encode("utf-8")).hexdigest()[:12]
+        if suffix:
+            safe = "".join([c for c in suffix if c.isalnum() or c in "-_"])[:60]
+            fname = f"{city}_{safe}_{stamp}.{ext}"
+        else:
+            fname = f"{city}_{stamp}.{ext}"
+        outfile = self.output_dir / fname
+        return str(outfile)
 
-    def _run_subprocess(self, exe_path: str, args: list, timeout: Optional[int], exe_cwd: Optional[str]):
+    def run_cli_once(self, url: str, outfile: str, output_format: str = "json", timeout: Optional[int] = None) -> dict:
         """
-        Запускает subprocess с exe_path и args (список). Возвращает dict с полями ok, returncode, stdout, stderr.
+        Один запуск CLI для одного URL. Возвращает dict с ключами: ok, outfile, stdout, stderr, returncode
         """
-        cmd = [exe_path] + args
+        cmd = [self._binary_path or self.parser_cmd, "-i", url, "-o", outfile, "-f", output_format]
         try:
-            self.logger(f"Executing: {cmd}")
-            if exe_cwd:
-                self.logger(f"cwd: {exe_cwd}")
-            proc = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=timeout, cwd=exe_cwd)
+            proc = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=timeout)
             stdout = proc.stdout or ""
             stderr = proc.stderr or ""
-            self.logger(f"Returncode={proc.returncode}, stderr_len={len(stderr)}")
-            if stderr:
-                self.logger(f"stderr (head): {stderr.strip()[:1000]}")
-            return {"ok": proc.returncode == 0, "stdout": stdout, "stderr": stderr, "returncode": proc.returncode}
+            ok = proc.returncode == 0
+            return {"ok": ok, "outfile": outfile, "stdout": stdout, "stderr": stderr, "returncode": proc.returncode}
         except subprocess.TimeoutExpired as e:
-            return {"ok": False, "stdout": "", "stderr": f"TimeoutExpired: {e}", "returncode": -1}
+            return {"ok": False, "outfile": outfile, "stdout": "", "stderr": f"TimeoutExpired: {e}", "returncode": -1}
         except Exception as e:
-            return {"ok": False, "stdout": "", "stderr": str(e), "returncode": -1}
+            return {"ok": False, "outfile": outfile, "stdout": "", "stderr": str(e), "returncode": -1}
 
-    def run_cli(self, city: str, query: str, out_filename: Optional[str] = None,
-                output_format: str = "json", timeout: int = 120) -> Any:
+    def run_batch(self, city: str, dgis_ids: List[str], output_format: str = "json",
+                  outfile: Optional[str] = None, timeout: int = 600) -> Dict[str, Any]:
         """
-        Безопасно запускает parser-2gis:
-         - формирует url = https://2gis.ru/{city}/search/{query}
-         - формирует абсолютный outfile (если out_filename не указан — автогенерация)
-         - запускает команду: <exe> -i <url> -o <outfile> -f <output_format>
-        Возвращает десериализованный JSON (или путь к csv, или None при ошибке).
+        Запускает parser-2gis один раз для набора inside-URL'ов:
+          url = https://2gis.ru/<city>/inside/<dgis_id>
+        Возвращает словарь:
+          {"ok": bool, "outfile": path, "data": parsed_json_or_list_or_none, "stderr": str, "returncode": int}
+
+        Если outfile не указан — создаётся автоматически в output_dir.
         """
+        if not dgis_ids:
+            return {"ok": True, "outfile": None, "data": [], "stderr": "", "returncode": 0}
+
         if not self._binary_path:
-            self.logger("parser-2gis не найден")
-            return None
+            msg = f"Ошибка: бинарь parser-2gis ('{self.parser_cmd}') не найден."
+            self.logger(msg)
+            return {"ok": False, "outfile": outfile, "data": None, "stderr": msg, "returncode": -1}
 
-        url = f"https://2gis.ru/{quote_plus(city)}/search/{quote_plus(query)}"
-        ext = "json" if output_format.lower() == "json" else "csv"
-        outfile = out_filename if out_filename else self._make_outfile(city, query, ext)
-        # убедимся, что путь абсолютный
-        outfile = str(Path(outfile).resolve())
-        # определим exe cwd — папка с бинарём
-        exe_cwd = str(Path(self._binary_path).parent)
+        # формируем URL'ы
+        city_part = city or ""
+        # не quote_plus для id, но city может требовать кодирования
+        city_encoded = quote_plus(city_part)
+        urls = [f"https://2gis.ru/{city_encoded}/inside/{dgid}" for dgid in dgis_ids]
 
-        args = ["-i", url, "-o", outfile, "-f", output_format]
+        if not outfile:
+            suffix = "_".join(dgis_ids[:3])
+            outfile = self._make_outfile(city_part, suffix=suffix, ext=output_format if output_format != "csv" else "csv")
 
-        res = self._run_subprocess(self._binary_path, args, timeout=timeout, exe_cwd=exe_cwd)
-        if not res["ok"]:
-            self.logger(f"CLI returned code {res['returncode']}. stderr: {res['stderr']}")
-            return None
+        # команда: parser-2gis -i <url1> <url2> ... -o <outfile> -f <format>
+        cmd = [self._binary_path or self.parser_cmd, "-i"] + urls + ["-o", outfile, "-f", output_format]
+        attempt = 0
+        last_err = None
+        while attempt <= self.max_retries:
+            attempt += 1
+            self.logger(f"2GIS (batch): запуск CLI для {len(urls)} URL'ов -> {outfile} (attempt {attempt}/{self.max_retries+1})")
+            try:
+                proc = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=timeout)
+                stdout = proc.stdout or ""
+                stderr = proc.stderr or ""
+                if proc.returncode == 0:
+                    # попробуем прочитать JSON (если формат json)
+                    data = None
+                    if output_format == "json":
+                        try:
+                            with open(outfile, "r", encoding="utf-8") as f:
+                                data = json.load(f)
+                        except Exception as e:
+                            self.logger(f"2GIS (batch): не удалось прочитать JSON {outfile}: {e}")
+                            data = None
+                    return {"ok": True, "outfile": outfile, "data": data, "stderr": stderr, "stdout": stdout, "returncode": proc.returncode}
+                else:
+                    last_err = f"CLI returned {proc.returncode}. stderr: {stderr.strip()}"
+                    self.logger(f"2GIS (batch) error: {last_err}")
+            except subprocess.TimeoutExpired as e:
+                last_err = f"TimeoutExpired: {e}"
+                self.logger(f"2GIS (batch) timeout: {last_err}")
+            except Exception as e:
+                last_err = str(e)
+                self.logger(f"2GIS (batch) exception: {last_err}")
 
-        # при csv — просто возвращаем путь к файлу
-        if output_format.lower() == "csv":
-            return outfile
+            # retry backoff
+            if attempt <= self.max_retries:
+                sleep_time = self.retry_backoff * (2 ** (attempt - 1))
+                self.logger(f"2GIS (batch): retry after {sleep_time:.1f}s")
+                time.sleep(sleep_time)
 
-        # при json — попробуем загрузить
-        try:
-            with open(outfile, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            self.logger(f"Не удалось прочитать JSON {outfile}: {e}")
-            return None
+        return {"ok": False, "outfile": outfile, "data": None, "stderr": last_err or "Unknown", "returncode": -1}
 
-    def run_cli_shell(self, city: str, query: str, out_filename: Optional[str] = None,
-                      output_format: str = "json", timeout: int = 120) -> Any:
+    def run(self, city: str, address: str, **kwargs):
         """
-        Альтернатива: строит строку и запускает через shell=True.
-        НЕ рекомендуется при параметрах из ненадёжных источников (возможность инъекции).
+        Совместимость с старым API: run возвращает результат (или []/None).
+        По умолчанию выполняет run_batch для одиночного адреса.
         """
-        if not self._binary_path:
-            self.logger("parser-2gis не найден")
-            return None
+        return self.run_batch(city, [address], **kwargs)
 
-        url = f"https://2gis.ru/{quote_plus(city)}/search/{quote_plus(query)}"
-        ext = "json" if output_format.lower() == "json" else "csv"
-        outfile = out_filename if out_filename else self._make_outfile(city, query, ext)
-        outfile = str(Path(outfile).resolve())
-        # формируем строку с корректным quoting для Windows (используем двойные кавычки)
-        cmd_str = f'"{self._binary_path}" -i "{url}" -o "{outfile}" -f {output_format}'
-        self.logger(f"Executing shell: {cmd_str}")
-        try:
-            proc = subprocess.run(cmd_str, shell=True, capture_output=True, text=True, timeout=timeout, cwd=str(Path(self._binary_path).parent))
-            if proc.returncode != 0:
-                self.logger(f"shell returned {proc.returncode}, stderr: {proc.stderr}")
-                return None
-            if output_format.lower() == "csv":
-                return outfile
-            with open(outfile, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            self.logger(f"Shell-run error: {e}")
-            return None
+    def save_stats(self):
+        pass

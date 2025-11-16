@@ -276,23 +276,179 @@ def start_parse_2gis_bg(session_id):
     dbp = ensure_temp_db(session_id)
     parser_cmd = request.form.get("parser_cmd") or request.form.get("parser_bin") or "parser-2gis"
 
+    # Параметры батчинга
+    batch_size = int(request.form.get("batch_size", 50))  # сколько id за один запуск CLI
+    output_format = request.form.get("output_format", "json")
+    timeout_per_batch = int(request.form.get("timeout", 600))
+
+    output_root = Path(TEMP_ROOT) / session_id / "2gis_results"
+    output_root.mkdir(parents=True, exist_ok=True)
+
     def target(progress_callback=None):
-        mgr = ParsingAddressesManager(log=app.logger.info)
-        if hasattr(mgr, "parse_buildings_with_2gis"):
-            # try to call with signature we expect
+        parser = TwoGisCliParser(output_dir=str(output_root), parser_cmd=parser_cmd, logger=app.logger.info)
+
+        conn = sqlite3.connect(str(dbp))
+        cur = conn.cursor()
+        # выбираем записи с dgis_id и без raw_json (т.е. ещё не обработаны)
+        cur.execute("""
+            SELECT b.id, b.dgis_id, c.name
+            FROM buildings b
+            JOIN streets s ON b.street_id = s.id
+            JOIN districts d ON s.district_id = d.id
+            JOIN cities c ON d.city_id = c.id
+            WHERE b.dgis_id IS NOT NULL AND b.dgis_id != ''
+              AND (b.raw_json IS NULL OR b.raw_json = '')
+            ORDER BY c.name, d.name, s.name
+        """)
+        rows = cur.fetchall()
+        total = len(rows)
+        if total == 0:
+            conn.close()
+            if progress_callback:
+                progress_callback(100, "Нет зданий с dgis_id для обработки", {"total": 0})
+            return
+
+        # собрать словарь city -> list of (building_id, dgis_id)
+        per_city = {}
+        for b_id, dgis_id, city_name in rows:
+            city_name = (city_name or "").strip() or "irkutsk"
+            per_city.setdefault(city_name, []).append((b_id, str(dgis_id)))
+
+        processed = 0
+        success = 0
+        errors = 0
+        batch_index = 0
+
+        import re
+        def extract_id_from_item(item) -> Optional[str]:
+            """
+            Пытаемся извлечь внутри-идентификатор из одной записи CLI:
+            ищем поля 'id' или 'url' и паттерны '/inside/<id>' или '/geo/<id>'.
+            """
             try:
-                mgr.parse_buildings_with_2gis(str(dbp), parser_cmd=parser_cmd, max_workers=2, progress_callback=progress_callback)
-            except TypeError:
-                # fallback to simpler signature
-                mgr.parse_buildings_with_2gis(str(dbp), progress_callback=progress_callback)
-        else:
-            # fallback: try TwoGisCliParser on sample rows (simple)
-            raise RuntimeError("Manager has no parse_buildings_with_2gis method")
+                # если item — dict, проверим очевидные поля
+                if isinstance(item, dict):
+                    for k in ("id", "entity_id", "object_id"):
+                        if k in item and item[k]:
+                            return str(item[k])
+                    # иногда есть url или link
+                    for key in ("url", "link", "canonical_url"):
+                        v = item.get(key)
+                        if isinstance(v, str) and v:
+                            m = re.search(r"/(?:inside|geo)/([0-9A-Za-z_%-]+)", v)
+                            if m:
+                                return m.group(1)
+                    # иногда есть nested fields
+                    # попробуем сериализовать и искать
+                    s = json.dumps(item, ensure_ascii=False)
+                    m = re.search(r"/(?:inside|geo)/([0-9A-Za-z_%-]+)", s)
+                    if m:
+                        return m.group(1)
+                else:
+                    # если строка
+                    s = str(item)
+                    m = re.search(r"/(?:inside|geo)/([0-9A-Za-z_%-]+)", s)
+                    if m:
+                        return m.group(1)
+            except Exception:
+                pass
+            return None
+
+        # Обрабатываем по городам и батчам
+        for city_name, items in per_city.items():
+            # items: list of (b_id, dgis_id)
+            dgis_list = [dg for (_bid, dg) in items]
+            n = len(dgis_list)
+            i = 0
+            while i < n:
+                batch_index += 1
+                batch_ids = dgis_list[i:i + batch_size]
+                i += batch_size
+                processed_batch_total = len(batch_ids)
+
+                if progress_callback:
+                    progress_callback(
+                        int(processed / max(1, total) * 100),
+                        f"Запуск batch #{batch_index} для города {city_name} ({processed}/{total})",
+                        {"processed": processed, "success": success, "errors": errors}
+                    )
+
+                # запуск CLI одним вызовом для всех inside-URL'ов батча
+                res = parser.run_batch(city=city_name, dgis_ids=batch_ids, output_format=output_format,
+                                       outfile=None, timeout=timeout_per_batch)
+
+                if not res.get("ok"):
+                    errors += processed_batch_total
+                    app.logger.info(f"2GIS batch error: {res.get('stderr')}")
+                    # пометим все в батче как попытка (оставим raw_json пустым), но продолжаем
+                else:
+                    data = res.get("data")
+                    # если data None (например csv) — просто отметим как успешные вызовы (не сохраняем детали)
+                    if data is None:
+                        # попытка: если outfile exists and format csv, можем только mark processed
+                        # здесь пометим, что CLI выполнился, но нет связки -> увеличим processed and continue
+                        success += processed_batch_total
+                    else:
+                        # data может быть списком объектов или словарём
+                        if isinstance(data, dict):
+                            # возможно формат { "items": [...] }
+                            candidates = []
+                            for v in data.values():
+                                if isinstance(v, list):
+                                    candidates.extend(v)
+                        elif isinstance(data, list):
+                            candidates = data
+                        else:
+                            candidates = [data]
+
+                        # создадим индекс найденных id -> list(items)
+                        found_map = {}
+                        for item in candidates:
+                            found = extract_id_from_item(item)
+                            if found:
+                                found_map.setdefault(found, []).append(item)
+
+                        # обновим БД: для каждой dgis_id в batch — если есть found_map[dgid] — запишем raw_json
+                        for bldg_id, dgid in [(bid, dg) for (bid, dg) in items if dg in batch_ids]:
+                            # ищем in found_map
+                            hits = found_map.get(dgid)
+                            if hits:
+                                # берем первое совпадение (можно сохранять массив)
+                                raw = json.dumps(hits[0], ensure_ascii=False)
+                                try:
+                                    cur.execute("UPDATE buildings SET raw_json = ?, dgis_id = ? WHERE id = ?", (raw, dgid, bldg_id))
+                                    conn.commit()
+                                    success += 1
+                                except Exception as e:
+                                    errors += 1
+                                    app.logger.exception(f"DB save error for {bldg_id}: {e}")
+                            else:
+                                # Если не найдено — можно сохранить empty string, чтобы не пытаться снова, либо оставить для повторной обработки
+                                # Здесь мы сохраняем пустой raw_json чтобы не бесконечно пытаться; можно изменить логику.
+                                try:
+                                    cur.execute("UPDATE buildings SET raw_json = ? WHERE id = ?", ("", bldg_id))
+                                    conn.commit()
+                                    errors += 1
+                                except Exception:
+                                    errors += 1
+
+                # обновление глобального processed (количество зданий помеченных как обработанные)
+                processed += processed_batch_total
+                if progress_callback:
+                    pct = int(processed / max(1, total) * 100)
+                    progress_callback(pct, f"Обработано {processed}/{total} (успех {success}, ошибки {errors})",
+                                      {"total": total, "processed": processed, "success": success, "errors": errors})
+
+        conn.close()
+        if progress_callback:
+            progress_callback(100, f"Finished. success={success}, errors={errors}", {"total": total, "processed": processed, "success": success, "errors": errors})
 
     ok, msg = _start_background_task(session_id, "2gis", target)
     if not ok:
         return jsonify({"error": msg}), 409
     return jsonify({"status": "started"}), 202
+
+
 
 
 @app.route("/start_extract_ids_bg/<session_id>", methods=["POST"])
