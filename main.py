@@ -1,7 +1,5 @@
 # main.py
-from main_interface import create_app
-
-app = create_app()
+from main_interface import app
 
 if __name__ == "__main__":
     # запускаем встроенным сервером flask (для разработки).

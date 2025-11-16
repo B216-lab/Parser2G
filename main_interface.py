@@ -2,354 +2,363 @@
 import os
 import uuid
 import threading
+import time
+import json
+import sqlite3
 from pathlib import Path
-from flask import Flask, render_template, request, redirect, url_for, flash, send_file, jsonify
+from typing import Dict, Any, Callable, Optional
+
+from flask import Flask, request, jsonify, render_template, redirect, url_for, flash, send_file
+
+# Логика (убедитесь, что эти модули есть в проекте)
 from logic.parsing_addresses import ParsingAddressesManager
-from utils.temp_db import create_temp_db, list_temp_db_sessions, db_path_for_session, get_city_ginfo_url_from_db
-from export_logic import export_db_to_csv
+from logic.two_gis_cli import TwoGisCliParser
+from logic.playwright_extractor import run_extract_ids
+
+# --- Конфигурация ---
+# Поменяйте при необходимости на ваш реальный путь (например "G:/Rab Stol/Parser2GISNew/data/temp")
+TEMP_ROOT = Path("data") / "temp"
+TEMP_ROOT.mkdir(parents=True, exist_ok=True)
+
+app = Flask(__name__)
+app.secret_key = "dev-please-change"  # change for production
 
 # tasks structure:
-# tasks = {
-#   session_id: {
-#       'districts': {'status','progress','message','counts'},
-#       'streets': {'...'},
-#       '2gis': {'...'}
-#   }
-# }
-tasks = {}
+# tasks[session_id][taskKey] = {"status": "queued|running|finished|error", "progress": int, "message": str, "counts": dict, "result": {...}}
+tasks: Dict[str, Dict[str, Dict[str, Any]]] = {}
 tasks_lock = threading.Lock()
 
-def create_app():
-    app = Flask(__name__)
-    app.secret_key = os.getenv("FLASK_SECRET", "dev-secret")
-    app.project_root = Path(__file__).resolve().parents[0]
-    app.temp_root = app.project_root / "data" / "temp"
-    app.temp_root.mkdir(parents=True, exist_ok=True)
 
-    def normalize_ginfo_url(raw: str) -> str:
-        if not raw:
-            return ""
-        raw = raw.strip()
-        if raw.startswith("http://") or raw.startswith("https://"):
-            return raw.rstrip("/")
-        return "https://" + raw.rstrip("/")
+# ----------------- Database helpers -----------------
+def make_session_db_path(session_id: str) -> Path:
+    return TEMP_ROOT / f"{session_id}.db"
 
-    @app.route("/", methods=["GET"])
-    def index():
-        fallback_ginfo = request.args.get("ginfo_url", "").strip()
-        sessions = list_temp_db_sessions(app.temp_root)
-        for s in sessions:
-            try:
-                s.ginfo_url = get_city_ginfo_url_from_db(s.path) or ""
-            except Exception:
-                s.ginfo_url = ""
-            if not s.ginfo_url and fallback_ginfo:
-                s.ginfo_url = fallback_ginfo
-        return render_template("index.html", sessions=sessions, fallback_ginfo=fallback_ginfo)
 
-    @app.route("/start_session", methods=["POST"])
-    def start_session():
-        session_id = uuid.uuid4().hex
-        db_path = db_path_for_session(app.temp_root, session_id)
+def ensure_temp_db(session_id: str) -> Path:
+    """Создать временную DB с минимальной схемой, если нет."""
+    db_path = make_session_db_path(session_id)
+    if db_path.exists():
+        return db_path
+
+    conn = sqlite3.connect(str(db_path))
+    cur = conn.cursor()
+    cur.executescript(
+        """
+        PRAGMA foreign_keys = ON;
+        CREATE TABLE IF NOT EXISTS cities (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT,
+            ginfo_url TEXT
+        );
+        CREATE TABLE IF NOT EXISTS districts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            city_id INTEGER REFERENCES cities(id) ON DELETE CASCADE,
+            name TEXT,
+            url TEXT
+        );
+        CREATE TABLE IF NOT EXISTS streets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            district_id INTEGER REFERENCES districts(id) ON DELETE CASCADE,
+            name TEXT,
+            url TEXT,
+            buildings_json TEXT
+        );
+        CREATE TABLE IF NOT EXISTS buildings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            street_id INTEGER REFERENCES streets(id) ON DELETE CASCADE,
+            address TEXT,
+            url TEXT,
+            raw_json TEXT,
+            dgis_id TEXT
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+    return db_path
+
+
+def list_sessions() -> list:
+    """Собираем список существующих .db файлов в TEMP_ROOT и читаем мета (ginfo_url если есть)"""
+    out = []
+    for p in sorted(TEMP_ROOT.glob("*.db")):
+        sid = p.stem
+        ginfo = None
         try:
-            create_temp_db(str(db_path))
-            flash(f"Создана сессия {session_id}", "success")
-        except Exception as e:
-            app.logger.exception("Ошибка создания сессии")
-            flash(f"Ошибка при создании сессии: {e}", "danger")
-        return redirect(url_for("index"))
-
-    @app.route("/parse_districts/<session_id>", methods=["POST"])
-    def parse_districts(session_id):
-        raw_ginfo = request.form.get("ginfo_url", "").strip()
-        if not raw_ginfo:
-            flash("Укажите ссылку на Ginfo (например irkutsk.ginfo.ru)", "danger")
-            return redirect(url_for("index"))
-        ginfo_url = normalize_ginfo_url(raw_ginfo)
-        db_path = db_path_for_session(app.temp_root, session_id)
-        if not db_path.exists():
-            flash("Сессия не найдена.", "danger")
-            return redirect(url_for("index"))
-        logger = lambda msg: app.logger.info(f"[session {session_id}] {msg}")
-        manager = ParsingAddressesManager(log=logger, base_url=ginfo_url)
-        try:
-            manager.parse_districts_to_db(db_path=str(db_path))
-            flash("Парсинг районов завершён.", "success")
-        except Exception as e:
-            app.logger.exception("Ошибка при парсинге районов")
-            flash(f"Ошибка при парсинге районов: {e}", "danger")
-        return redirect(url_for("index", ginfo_url=raw_ginfo))
-
-    @app.route("/start_parse_districts_bg/<session_id>", methods=["POST"])
-    def start_parse_districts_bg(session_id):
-        raw_ginfo = request.form.get("ginfo_url", "").strip()
-        db_path = db_path_for_session(app.temp_root, session_id)
-        if not db_path.exists():
-            return jsonify({"error": "session not found"}), 404
-
-        with tasks_lock:
-            sess = tasks.setdefault(session_id, {})
-            if sess.get("districts", {}).get("status") == "running":
-                return jsonify({"status": "already running"}), 400
-            sess["districts"] = {"status": "queued", "progress": 0, "message": "Queued", "counts": {}}
-            sess.setdefault("streets", {"status": "idle", "progress": 0, "message": "", "counts": {}})
-            sess.setdefault("2gis", {"status": "idle", "progress": 0, "message": "", "counts": {}})
-
-        ginfo_url = normalize_ginfo_url(raw_ginfo) if raw_ginfo else get_city_ginfo_url_from_db(str(db_path)) or None
-
-        def target(session_id_local, db_path_local, ginfo_local):
-            try:
-                logger = lambda msg: app.logger.info(f"[session {session_id_local}] {msg}")
-                manager = ParsingAddressesManager(log=logger, base_url=ginfo_local)
-                def progress_cb(percent, message=None, counts=None):
-                    with tasks_lock:
-                        tasks[session_id_local]["districts"]["progress"] = int(percent)
-                        tasks[session_id_local]["districts"]["status"] = "running"
-                        if message is not None:
-                            tasks[session_id_local]["districts"]["message"] = message
-                        if counts is not None:
-                            tasks[session_id_local]["districts"]["counts"] = counts
-
-                tasks[session_id_local]["districts"]["message"] = "Парсинг районов..."
-                manager.parse_districts_to_db(db_path=str(db_path_local), progress_callback=progress_cb)
-                with tasks_lock:
-                    tasks[session_id_local]["districts"]["progress"] = 100
-                    tasks[session_id_local]["districts"]["status"] = "finished"
-                    tasks[session_id_local]["districts"]["message"] = "Районы спарсены"
-            except Exception as e:
-                app.logger.exception("Background districts error")
-                with tasks_lock:
-                    tasks[session_id_local]["districts"]["status"] = "error"
-                    tasks[session_id_local]["districts"]["message"] = str(e)
-
-        thread = threading.Thread(target=target, args=(session_id, db_path, ginfo_url), daemon=True)
-        thread.start()
-        return jsonify({"status": "started"}), 202
-
-    @app.route("/parse_streets/<session_id>", methods=["POST"])
-    def parse_streets(session_id):
-        db_path = db_path_for_session(app.temp_root, session_id)
-        if not db_path.exists():
-            flash("Сессия не найдена.", "danger")
-            return redirect(url_for("index"))
-        logger = lambda msg: app.logger.info(f"[session {session_id}] {msg}")
-        manager = ParsingAddressesManager(log=logger)
-        try:
-            manager.parse_all_streets_to_db(db_path=str(db_path))
-            flash("Парсинг улиц и домов завершён.", "success")
-        except Exception as e:
-            app.logger.exception("Ошибка при парсинге улиц")
-            flash(f"Ошибка при парсинге улиц: {e}", "danger")
-        session_ginfo = get_city_ginfo_url_from_db(str(db_path)) or ""
-        return redirect(url_for("index", ginfo_url=session_ginfo))
-
-    @app.route("/start_parse_streets_bg/<session_id>", methods=["POST"])
-    def start_parse_streets_bg(session_id):
-        db_path = db_path_for_session(app.temp_root, session_id)
-        if not db_path.exists():
-            return jsonify({"error": "session not found"}), 404
-
-        with tasks_lock:
-            sess = tasks.setdefault(session_id, {})
-            if sess.get("streets", {}).get("status") == "running":
-                return jsonify({"status": "already running"}), 400
-            sess["streets"] = {"status": "queued", "progress": 0, "message": "Queued", "counts": {}}
-            sess.setdefault("districts", {"status": "idle", "progress": 0, "message": "", "counts": {}})
-            sess.setdefault("2gis", {"status": "idle", "progress": 0, "message": "", "counts": {}})
-
-        # base_url берём из DB, если есть
-        ginfo_url = get_city_ginfo_url_from_db(str(db_path)) or None
-
-        def target(session_id_local, db_path_local, ginfo_local):
-            try:
-                logger = lambda msg: app.logger.info(f"[session {session_id_local}] {msg}")
-                manager = ParsingAddressesManager(log=logger, base_url=ginfo_local)
-                def progress_cb(percent, message=None, counts=None):
-                    with tasks_lock:
-                        tasks[session_id_local]["streets"]["progress"] = int(percent)
-                        tasks[session_id_local]["streets"]["status"] = "running"
-                        if message is not None:
-                            tasks[session_id_local]["streets"]["message"] = message
-                        if counts is not None:
-                            tasks[session_id_local]["streets"]["counts"] = counts
-
-                tasks[session_id_local]["streets"]["message"] = "Парсинг улиц..."
-                manager.parse_all_streets_to_db(db_path=str(db_path_local), progress_callback=progress_cb, max_workers=6)
-                with tasks_lock:
-                    tasks[session_id_local]["streets"]["progress"] = 100
-                    tasks[session_id_local]["streets"]["status"] = "finished"
-                    tasks[session_id_local]["streets"]["message"] = "Улицы спарсены"
-            except Exception as e:
-                app.logger.exception("Background streets error")
-                with tasks_lock:
-                    tasks[session_id_local]["streets"]["status"] = "error"
-                    tasks[session_id_local]["streets"]["message"] = str(e)
-
-        thread = threading.Thread(target=target, args=(session_id, db_path, ginfo_url), daemon=True)
-        thread.start()
-        return jsonify({"status": "started"}), 202
-
-    @app.route("/start_parse_2gis_bg/<session_id>", methods=["POST"])
-    def start_parse_2gis_bg(session_id):
-        parser_cmd = request.form.get("parser_cmd", "parser-2gis").strip()
-        try:
-            max_workers = int(request.form.get("max_workers", 2))
+            conn = sqlite3.connect(str(p))
+            cur = conn.cursor()
+            cur.execute("SELECT ginfo_url FROM cities LIMIT 1")
+            r = cur.fetchone()
+            if r and r[0]:
+                ginfo = r[0]
+            conn.close()
         except Exception:
-            max_workers = 2
-        city_name = request.form.get("city_name", None)
+            ginfo = None
+        out.append({"id": sid, "path": str(p), "ginfo_url": ginfo})
+    return out
 
-        db_path = db_path_for_session(app.temp_root, session_id)
-        if not db_path.exists():
-            return jsonify({"error": "session not found"}), 404
 
-        # DIAGNOSTICS: считаем pending используя ту же логику (primitive raw_json)
+# ----------------- Task helpers -----------------
+def update_task(session_id: str, task_key: str, *, status: Optional[str] = None,
+                progress: Optional[int] = None, message: Optional[str] = None, counts: Optional[dict] = None, result: Optional[dict] = None):
+    with tasks_lock:
+        if session_id not in tasks:
+            tasks[session_id] = {}
+        rec = tasks[session_id].get(task_key, {})
+        if status is not None:
+            rec["status"] = status
+        if progress is not None:
+            rec["progress"] = int(progress)
+            rec["percent"] = int(progress)  # backward compatibility
+        if message is not None:
+            rec["message"] = str(message)
+        if counts is not None:
+            rec["counts"] = counts
+        if result is not None:
+            rec["result"] = result
+        tasks[session_id][task_key] = rec
+
+
+def _start_background_task(session_id: str, task_key: str, target_fn: Callable[..., Any], *args, **kwargs) -> (bool, str):
+    """
+    Generic runner: запускает target_fn в фоне. target_fn должен принимать progress_callback kwarg.
+    """
+    with tasks_lock:
+        if session_id not in tasks:
+            tasks[session_id] = {}
+        existing = tasks[session_id].get(task_key)
+        if existing and existing.get("status") == "running":
+            return False, "already running"
+        # set queued
+        tasks[session_id][task_key] = {"status": "queued", "progress": 0, "message": "Queued", "counts": {}}
+
+    def runner():
+        update_task(session_id, task_key, status="running", progress=0, message="Started", counts={})
         try:
-            import sqlite3
-            conn_dbg = sqlite3.connect(str(db_path))
-            cur_dbg = conn_dbg.cursor()
-            cur_dbg.execute("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='buildings'")
-            if cur_dbg.fetchone()[0] == 0:
-                app.logger.info(f"[session {session_id}] DEBUG: В БД {db_path} нет таблицы buildings")
-                total_buildings = 0
-                pending = 0
-                sample = []
-            else:
-                cur_dbg.execute("SELECT count(*) FROM buildings")
-                total_buildings = cur_dbg.fetchone()[0]
-
-                # подсчитаем pending вручную в Python (без json1) — читаем пачками
-                pending = 0
-                sample = []
-                fetch_size = 2000
-                cur_dbg.execute("""
-                    SELECT b.id, s.name AS street, b.address, b.raw_json
-                    FROM buildings b
-                    JOIN streets s ON b.street_id = s.id
-                """)
-                while True:
-                    batch = cur_dbg.fetchmany(fetch_size)
-                    if not batch:
-                        break
-                    for row in batch:
-                        rid, street, address, raw = row
-                        # переиспользуем ту же логику: primitive JSON -> pending
-                        is_primitive = False
-                        try:
-                            if raw is None or str(raw).strip() == "":
-                                is_primitive = True
-                            else:
-                                parsed = json.loads(raw)
-                                if isinstance(parsed, (str, int, float, bool, type(None))):
-                                    is_primitive = True
-                                elif isinstance(parsed, list) and all(isinstance(it, (str, int, float, bool, type(None))) for it in parsed):
-                                    is_primitive = True
-                        except Exception:
-                            is_primitive = True
-                        if is_primitive:
-                            pending += 1
-                            if len(sample) < 5:
-                                sample.append((rid, street, address, raw))
-            conn_dbg.close()
+            def progress_cb(pct: int, msg: str, counts_dict: dict):
+                # normalize pct to 0..100
+                try:
+                    pp = int(pct)
+                    if pp < 0: pp = 0
+                    if pp > 100: pp = 100
+                except Exception:
+                    pp = 0
+                update_task(session_id, task_key, progress=pp, message=msg, counts=counts_dict or {})
+            # call target (target should accept progress_callback=progress_cb)
+            target_fn(*args, progress_callback=progress_cb, **kwargs)
+            update_task(session_id, task_key, status="finished", progress=100, message="Finished")
         except Exception as e:
-            app.logger.exception(f"[session {session_id}] DEBUG: ошибка при чтении БД {db_path}: {e}")
-            total_buildings = None
-            pending = None
-            sample = []
-
-        app.logger.info(f"[session {session_id}] DEBUG DB path: {db_path}")
-        app.logger.info(f"[session {session_id}] DEBUG buildings total={total_buildings}, pending(need 2GIS)={pending}")
-        if sample:
-            for r in sample:
-                app.logger.info(f"[session {session_id}] DEBUG sample row: id={r[0]}, street={r[1]}, address={r[2]}, raw_head={str(r[3])[:200]}")
+            update_task(session_id, task_key, status="error", message=str(e))
+    th = threading.Thread(target=runner, daemon=True)
+    th.start()
+    return True, "started"
 
 
-        # Инициализация задачи в tasks
-        with tasks_lock:
-            sess = tasks.setdefault(session_id, {})
-            if sess.get("2gis", {}).get("status") == "running":
-                return jsonify({"status": "already running"}), 400
-            sess["2gis"] = {"status": "queued", "progress": 0, "message": "Queued", "counts": {}}
-            sess.setdefault("districts", {"status": "idle", "progress": 0, "message": "", "counts": {}})
-            sess.setdefault("streets", {"status": "idle", "progress": 0, "message": "", "counts": {}})
-
-        def target(session_id_local, db_path_local, parser_cmd_local, max_workers_local, city_name_local):
-            try:
-                logger = lambda msg: app.logger.info(f"[session {session_id_local}] {msg}")
-                manager = ParsingAddressesManager(log=logger)
-                def progress_cb(percent, message=None, counts=None):
-                    with tasks_lock:
-                        tasks[session_id_local]["2gis"]["progress"] = int(percent)
-                        tasks[session_id_local]["2gis"]["status"] = "running"
-                        if message is not None:
-                            tasks[session_id_local]["2gis"]["message"] = message
-                        if counts is not None:
-                            tasks[session_id_local]["2gis"]["counts"] = counts
-
-                tasks[session_id_local]["2gis"]["message"] = "Запуск 2GIS парсинга..."
-                result = manager.parse_buildings_with_2gis(
-                    db_path=str(db_path_local),
-                    parser_cmd=parser_cmd_local,
-                    max_workers=max_workers_local,
-                    progress_callback=progress_cb,
-                    city_name=city_name_local
-                )
-                with tasks_lock:
-                    tasks[session_id_local]["2gis"]["progress"] = 100
-                    tasks[session_id_local]["2gis"]["status"] = "finished"
-                    tasks[session_id_local]["2gis"]["message"] = f"2GIS: готово ({result.get('processed',0)} / {result.get('total',0)})"
-                    tasks[session_id_local]["2gis"]["counts"] = result
-            except Exception as e:
-                app.logger.exception("Background 2GIS error")
-                with tasks_lock:
-                    tasks[session_id_local]["2gis"]["status"] = "error"
-                    tasks[session_id_local]["2gis"]["message"] = str(e)
-
-        thread = threading.Thread(
-            target=target,
-            args=(session_id, db_path, parser_cmd, max_workers, city_name),
-            daemon=True
-        )
-        thread.start()
-        return jsonify({"status": "started"}), 202
+# ----------------- Flask routes -----------------
+@app.route("/", methods=["GET"])
+def index():
+    sessions = list_sessions()
+    fallback_ginfo = request.args.get("ginfo_url", "")
+    return render_template("index.html", sessions=sessions, fallback_ginfo=fallback_ginfo)
 
 
-    @app.route("/task_status/<session_id>/<task_type>", methods=["GET"])
-    def task_status(session_id, task_type):
-        with tasks_lock:
-            sess = tasks.get(session_id)
-            if not sess:
-                return jsonify({"status": "not_found"}), 404
-            task = sess.get(task_type)
-            if not task:
-                return jsonify({"status": "not_found", "task": task_type}), 404
-            return jsonify(task)
+@app.route("/start_session", methods=["POST"])
+def start_session():
+    session_id = uuid.uuid4().hex
+    ensure_temp_db(session_id)
+    flash(f"Session created: {session_id}", "success")
+    return redirect(url_for("index"))
 
-    @app.route("/export_csv/<session_id>", methods=["GET"])
-    def export_csv(session_id):
-        db_path = db_path_for_session(app.temp_root, session_id)
-        if not db_path.exists():
-            flash("Сессия не найдена.", "danger")
-            return redirect(url_for("index"))
+
+@app.route("/delete_session/<session_id>", methods=["POST"])
+def delete_session(session_id):
+    dbp = make_session_db_path(session_id)
+    if dbp.exists():
         try:
-            csv_path = export_db_to_csv(db_path=str(db_path), out_dir=str(app.temp_root))
-            return send_file(csv_path, as_attachment=True)
+            dbp.unlink()
+            flash(f"Session {session_id} removed", "success")
         except Exception as e:
-            app.logger.exception("Ошибка при экспорте")
-            flash(f"Ошибка при экспорте: {e}", "danger")
-            return redirect(url_for("index"))
+            flash(f"Can't remove session: {e}", "danger")
+    else:
+        flash("Session not found", "warning")
+    return redirect(url_for("index"))
 
-    @app.route("/delete_session/<session_id>", methods=["POST"])
-    def delete_session(session_id):
-        db_path = db_path_for_session(app.temp_root, session_id)
-        try:
-            if db_path.exists():
-                db_path.unlink()
-                flash("Сессия удалена.", "success")
-            else:
-                flash("Сессия не найдена.", "warning")
-        except Exception as e:
-            app.logger.exception("Ошибка удаления сессии")
-            flash(f"Не удалось удалить сессию: {e}", "danger")
+
+@app.route("/export_csv/<session_id>", methods=["GET"])
+def export_csv(session_id):
+    # very simple export: dump buildings table to CSV
+    dbp = make_session_db_path(session_id)
+    if not dbp.exists():
+        flash("DB not found", "danger")
+        return redirect(url_for("index"))
+    out_csv = TEMP_ROOT / f"{session_id}_buildings.csv"
+    try:
+        conn = sqlite3.connect(str(dbp))
+        cur = conn.cursor()
+        cur.execute("SELECT id, address, raw_json, dgis_id FROM buildings")
+        rows = cur.fetchall()
+        import csv
+        with open(out_csv, "w", encoding="utf-8", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["id", "address", "raw_json_head", "dgis_id"])
+            for r in rows:
+                raw = r[2]
+                head = raw[:200] if raw else ""
+                w.writerow([r[0], r[1], head, r[3]])
+        conn.close()
+        return send_file(str(out_csv), as_attachment=True, download_name=out_csv.name)
+    except Exception as e:
+        flash(f"Export failed: {e}", "danger")
         return redirect(url_for("index"))
 
-    return app
+
+# ---------- Sync parsing endpoints (used by index.html forms) ----------
+@app.route("/parse_districts/<session_id>", methods=["POST"])
+def parse_districts(session_id):
+    dbp = ensure_temp_db(session_id)
+    ginfo_url = request.form.get("ginfo_url") or None
+    try:
+        manager = ParsingAddressesManager(log=app.logger.info, base_url=ginfo_url)
+        # synchronous blocking call
+        manager.parse_districts_to_db(str(dbp))
+        flash("Районы спарсены (синхронно)", "success")
+    except Exception as e:
+        app.logger.exception("parse_districts error")
+        flash(f"Ошибка парсинга районов: {e}", "danger")
+    return redirect(url_for("index"))
+
+
+@app.route("/parse_streets/<session_id>", methods=["POST"])
+def parse_streets(session_id):
+    dbp = ensure_temp_db(session_id)
+    try:
+        manager = ParsingAddressesManager(log=app.logger.info)
+        manager.parse_all_streets_to_db(str(dbp))
+        flash("Улицы спарсены (синхронно)", "success")
+    except Exception as e:
+        app.logger.exception("parse_streets error")
+        flash(f"Ошибка парсинга улиц: {e}", "danger")
+    return redirect(url_for("index"))
+
+
+# ---------- Background endpoints (used by buttons / JS polling) ----------
+@app.route("/start_parse_districts_bg/<session_id>", methods=["POST"])
+def start_parse_districts_bg(session_id):
+    dbp = ensure_temp_db(session_id)
+    ginfo_url = request.form.get("ginfo_url") or request.form.get("ginfo") or None
+
+    def target(progress_callback=None):
+        mgr = ParsingAddressesManager(log=app.logger.info, base_url=ginfo_url)
+        mgr.parse_districts_to_db(str(dbp), progress_callback=progress_callback)
+
+    ok, msg = _start_background_task(session_id, "districts", target)
+    if not ok:
+        return jsonify({"error": msg}), 409
+    return jsonify({"status": "started"}), 202
+
+
+@app.route("/start_parse_streets_bg/<session_id>", methods=["POST"])
+def start_parse_streets_bg(session_id):
+    dbp = ensure_temp_db(session_id)
+
+    def target(progress_callback=None):
+        mgr = ParsingAddressesManager(log=app.logger.info)
+        mgr.parse_all_streets_to_db(str(dbp), progress_callback=progress_callback)
+
+    ok, msg = _start_background_task(session_id, "streets", target)
+    if not ok:
+        return jsonify({"error": msg}), 409
+    return jsonify({"status": "started"}), 202
+
+
+@app.route("/start_parse_2gis_bg/<session_id>", methods=["POST"])
+def start_parse_2gis_bg(session_id):
+    dbp = ensure_temp_db(session_id)
+    parser_cmd = request.form.get("parser_cmd") or request.form.get("parser_bin") or "parser-2gis"
+
+    def target(progress_callback=None):
+        mgr = ParsingAddressesManager(log=app.logger.info)
+        if hasattr(mgr, "parse_buildings_with_2gis"):
+            # try to call with signature we expect
+            try:
+                mgr.parse_buildings_with_2gis(str(dbp), parser_cmd=parser_cmd, max_workers=2, progress_callback=progress_callback)
+            except TypeError:
+                # fallback to simpler signature
+                mgr.parse_buildings_with_2gis(str(dbp), progress_callback=progress_callback)
+        else:
+            # fallback: try TwoGisCliParser on sample rows (simple)
+            raise RuntimeError("Manager has no parse_buildings_with_2gis method")
+
+    ok, msg = _start_background_task(session_id, "2gis", target)
+    if not ok:
+        return jsonify({"error": msg}), 409
+    return jsonify({"status": "started"}), 202
+
+
+@app.route("/start_extract_ids_bg/<session_id>", methods=["POST"])
+def start_extract_ids_bg(session_id):
+    dbp = ensure_temp_db(session_id)
+    city = request.form.get("city") or None
+    headless = request.form.get("headless", "false").lower() in ("1", "true", "yes")
+    try:
+        delay = float(request.form.get("delay", 0.6))
+    except Exception:
+        delay = 0.6
+    try:
+        limit = int(request.form.get("limit", 0))
+    except Exception:
+        limit = 0
+    try:
+        timeout_ms = int(request.form.get("timeout_ms", 12000))
+    except Exception:
+        timeout_ms = 12000
+
+    screenshots_dir = str(Path(TEMP_ROOT) / "playwright_screens")
+
+    def target(progress_callback=None):
+        run_extract_ids(
+            str(dbp),
+            city_override=city,
+            headless=headless,
+            delay=delay,
+            limit=limit,
+            timeout_ms=timeout_ms,
+            screenshots_dir=screenshots_dir,
+            progress_callback=progress_callback
+        )
+
+    ok, msg = _start_background_task(session_id, "extract_ids", target)
+    if not ok:
+        return jsonify({"error": msg}), 409
+    return jsonify({"status": "started"}), 202
+
+
+# ---------- Task status ----------
+@app.route("/task_status/<session_id>/<task_key>", methods=["GET"])
+def task_status(session_id, task_key):
+    with tasks_lock:
+        st = tasks.get(session_id, {}).get(task_key)
+        if not st:
+            return jsonify({"status": "idle", "progress": 0, "message": "", "counts": {}}), 200
+        # ensure keys presence
+        resp = {
+            "status": st.get("status", "idle"),
+            "progress": st.get("progress", st.get("percent", 0)),
+            "message": st.get("message", ""),
+            "counts": st.get("counts", {}),
+        }
+        return jsonify(resp), 200
+
+
+# ---------- Misc ----------
+@app.route("/download_db/<session_id>", methods=["GET"])
+def download_db(session_id):
+    dbp = make_session_db_path(session_id)
+    if not dbp.exists():
+        return jsonify({"error": "db not found"}), 404
+    return send_file(str(dbp), as_attachment=True, download_name=f"{session_id}.db")
+
+
+# ---------- Run ----------
+if __name__ == "__main__":
+    app.run(debug=True, host="0.0.0.0", port=5000)

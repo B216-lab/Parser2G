@@ -48,6 +48,9 @@
                   </form>
                   <button class="btn btn-info btn-sm ms-1" onclick="startBg2Gis('{{ s.id }}', this)">Парсить 2GIS (фон)</button>
 
+                  <!-- NEW: Playwright extract ids -->
+                  <button class="btn btn-outline-primary btn-sm ms-1" onclick="startBgExtractIds('{{ s.id }}', this)">Извлечь ID(Playwright)</button>
+
                   <!-- Progress for 2GIS -->
                   <div id="progress-2gis-{{ s.id }}" class="mt-2" style="display:none;">
                     <label class="small">2GIS</label>
@@ -56,7 +59,6 @@
                     </div>
                     <div id="progress-msg-2gis-{{ s.id }}" class="small text-muted mt-1"></div>
                   </div>
-
 
                   <!-- Progress for districts -->
                   <div id="progress-districts-{{ s.id }}" class="mt-2" style="display:none;">
@@ -76,6 +78,15 @@
                     <div id="progress-msg-streets-{{ s.id }}" class="small text-muted mt-1"></div>
                   </div>
 
+                  <!-- Progress for extract_ids (Playwright) -->
+                  <div id="progress-extract_ids-{{ s.id }}" class="mt-2" style="display:none;">
+                    <label class="small">Extract IDs (Playwright)</label>
+                    <div class="progress">
+                      <div id="progress-bar-extract_ids-{{ s.id }}" class="progress-bar bg-info" role="progressbar" style="width:0%">0%</div>
+                    </div>
+                    <div id="progress-msg-extract_ids-{{ s.id }}" class="small text-muted mt-1"></div>
+                  </div>
+
                 </td>
               </tr>
               {% endfor %}
@@ -91,7 +102,7 @@
     <ul>
       <li>Сессия — это отдельный временный файл БД (SQLite) в <code>data/temp/</code>.</li>
       <li>Кнопки <strong>Парсить районы (фон)</strong> и <strong>Парсить улицы (фон)</strong> запускают отдельные фоновые задачи и отображают прогресс.</li>
-      <li>Если сайт использует JavaScript для наполнения контента, возможно потребуется selenium.</li>
+      <li>Если сайт использует JavaScript для наполнения контента, возможно потребуется selenium/playwright.</li>
     </ul>
   </div>
 
@@ -151,7 +162,6 @@ function startBgStreets(sessionId, btn){
 // Запуск 2GIS (фон)
 function startBg2Gis(sessionId, btn){
   btn.disabled = true;
-  // можно передать parser_cmd и max_workers, если хотите — оставим по умолчанию
   const body = new URLSearchParams({ parser_cmd: "parser-2gis", max_workers: 2 });
   fetch(`/start_parse_2gis_bg/${sessionId}`, {
     method: 'POST',
@@ -159,7 +169,6 @@ function startBg2Gis(sessionId, btn){
     body: body
   }).then(r=>{
     if (r.status === 202 || r.ok) {
-      // покажем progress
       document.getElementById('progress-2gis-' + sessionId).style.display = 'block';
       pollTask(sessionId, '2gis', btn);
     } else {
@@ -171,7 +180,33 @@ function startBg2Gis(sessionId, btn){
   });
 }
 
-// Универсальная поллер-функция (используется и для districts/streets/2gis)
+// Функция запуска extract_ids (Playwright)
+function startBgExtractIds(sessionId, btn){
+  btn.disabled = true;
+  // default параметры: headless=false (видимый), delay=0.6, limit=0
+  const form = new URLSearchParams({
+    headless: "false",
+    delay: "0.6",
+    limit: "0"
+  });
+  fetch(`/start_extract_ids_bg/${sessionId}`, {
+    method: 'POST',
+    headers: {'Content-Type':'application/x-www-form-urlencoded'},
+    body: form
+  }).then(r=>{
+    if (r.status === 202 || r.ok) {
+      document.getElementById('progress-extract_ids-' + sessionId).style.display = 'block';
+      pollTask(sessionId, 'extract_ids', btn);
+    } else {
+      r.json().then(j=> { alert(JSON.stringify(j)); btn.disabled=false; }).catch(()=> btn.disabled=false);
+    }
+  }).catch(e=>{
+    console.error(e);
+    btn.disabled = false;
+  });
+}
+
+// Универсальная поллер-функция (используется и для districts/streets/2gis/extract_ids)
 function pollTask(sessionId, taskType, btn){
   fetch(`/task_status/${sessionId}/${taskType}`).then(r=>{
     if (!r.ok) throw new Error('status ' + r.status);
@@ -180,8 +215,9 @@ function pollTask(sessionId, taskType, btn){
     const pbar = document.getElementById(`progress-bar-${taskType}-${sessionId}`);
     const msg = document.getElementById(`progress-msg-${taskType}-${sessionId}`);
     if (pbar) {
-      pbar.style.width = (data.progress||0) + '%';
-      pbar.textContent = (data.progress||0) + '%';
+      const pct = data.progress || 0;
+      pbar.style.width = pct + '%';
+      pbar.textContent = pct + '%';
     }
     if (msg) msg.textContent = data.message || '';
     if (data.status === 'running' || data.status === 'queued') {
