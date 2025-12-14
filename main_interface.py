@@ -457,9 +457,9 @@ def start_extract_ids_bg(session_id):
     dbp = ensure_temp_db(session_id)  # используйте вашу функцию для получения path
     # читаем параметры из формы (JS может их отправлять)
     headless = request.form.get("headless", "false").lower() in ("1", "true", "yes")
-    concurrency = int(request.form.get("concurrency", 10))
+    concurrency = int(request.form.get("concurrency", 20))
     delay = float(request.form.get("delay", 0.6))
-    limit = int(request.form.get("limit", 50))
+    limit = int(request.form.get("limit", 0))
 
     def target(progress_callback=None):
         # Мы запускаем async extractor в этом фоновом потоке

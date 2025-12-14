@@ -170,6 +170,106 @@ async def _process_one(page: Page, url: str, timeout: int = 20000, log: Callable
     except Exception:
         pass
 
+    # Дополнительная стратегия: используем DOM-навигацию из библиотеки parser_2gis
+    # Вместо XPath, используем DOM-поиск, аналогичный реализации в parser_2gis
+    try:
+        # Получаем DOM-структуру страницы с помощью JavaScript
+        dom_content = await page.evaluate('''() => {
+            const traverseDOM = (node) => {
+                const result = {
+                    nodeId: 0, // В библиотеке parser_2gis это внутренний ID, здесь упрощаем
+                    backendNodeId: node.backendNodeId || 0,
+                    nodeType: node.nodeType,
+                    nodeName: node.nodeName,
+                    localName: node.localName || '',
+                    nodeValue: node.nodeValue || '',
+                    attributes: {},
+                    children: []
+                };
+                
+                if (node.attributes) {
+                    for (let attr of node.attributes) {
+                        result.attributes[attr.name] = attr.value;
+                    }
+                }
+                
+                if (node.children) {
+                    for (let child of node.children) {
+                        result.children.push(traverseDOM(child));
+                    }
+                }
+                
+                return result;
+            };
+            
+            return traverseDOM(document.body);
+        }''')
+        
+        # Имитируем функциональность поиска из parser_2gis
+        # Ищем все ссылки на странице, как это делается в библиотеке
+        def find_links_in_dom(dom_node, links=None):
+            if links is None:
+                links = []
+            
+            if dom_node.get('localName') == 'a' and 'href' in dom_node.get('attributes', {}):
+                links.append(dom_node)
+            elif dom_node.get('nodeName') == 'A' and 'href' in dom_node.get('attributes', {}):
+                links.append(dom_node)
+            
+            for child in dom_node.get('children', []):
+                find_links_in_dom(child, links)
+            
+            return links
+        
+        links = find_links_in_dom(dom_content)
+        for link in links[:30]:  # Ограничиваем количество проверяемых ссылок
+            href = link.get('attributes', {}).get('href', '')
+            if href:
+                # Проверяем, содержит ли ссылка искомые пути
+                if '/inside/' in href or '/geo/' in href or '/firm/' in href:
+                    # Пытаемся кликнуть на элемент через его селектор
+                    try:
+                        # Используем CSS-селектор для нахождения и клика по элементу
+                        selector = f"a[href='{href}']"
+                        element = await page.query_selector(selector)
+                        if element:
+                            await element.click(timeout=5000)
+                            # Ждем загрузки новой страницы
+                            try:
+                                await page.wait_for_load_state("networkidle", timeout=8000)
+                            except PlaywrightTimeoutError:
+                                # игнорируем — просто проверим URL
+                                pass
+                            
+                            # Проверяем URL на наличие ID в формате firm/<id> или других форматов
+                            current_url = page.url
+                            # Ищем паттерн firm/<id> в URL
+                            import re
+                            firm_pattern = r'/firm/(\d+(?:,\d+)*)'
+                            match = re.search(firm_pattern, current_url)
+                            if match:
+                                firm_id = match.group(1)
+                                return firm_id
+                            
+                            # Также ищем ID в формате, указанном в примере: https://2gis.ru/irkutsk/search/Волгоградская+80/firm/1548640652889703/104.220046%2C52.344908
+                            # где после firm/ и до координат находится ID
+                            firm_coord_pattern = r'/firm/(\d+(?:,\d+)*)(?:/|%)'
+                            match2 = re.search(firm_coord_pattern, current_url)
+                            if match2:
+                                firm_id = match2.group(1)
+                                return firm_id
+                            
+                            # Также проверяем, не появился ли geo ID после клика
+                            found = extract_id_from_url(current_url)
+                            if found:
+                                return found
+                    except Exception:
+                        # Если клик не удался, пробуем следующую ссылку
+                        continue
+    except Exception:
+        # Если DOM-навигация не сработала, продолжаем с другими стратегиями
+        pass
+
     return None
 
 

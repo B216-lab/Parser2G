@@ -21,6 +21,8 @@ build/
 venv/
 .venv/
 
+parser_2gis/
+
 data/
 data/temp
 !data/.gitkeep
