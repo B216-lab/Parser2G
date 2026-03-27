@@ -217,130 +217,102 @@ class Parser2GIS:
                 self._extract_from_json(item, results, depth + 1, path)
 
     def worker_fn(self, worker_idx: int, task_q: queue.Queue, stop_event: threading.Event, pbar):
-        """Функция потока: открывает браузер и парсит ссылки"""
         with sync_playwright() as p:
-            # Запускаем браузер с отключенными метками автоматизации
-            browser = p.chromium.launch(headless=False, args=["--disable-blink-features=AutomationControlled"])
+            browser = p.chromium.launch(
+                headless=True,  # ✅ Headless стабильнее и быстрее
+                args=["--disable-blink-features=AutomationControlled", "--disable-gpu"]
+            )
             context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                viewport={"width": 1920, "height": 1080}
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                viewport={"width": 1280, "height": 720}  # Меньше = быстрее
             )
-            
-            # ВАЖНО: Блокируем картинки, шрифты и стили. Это убивает "вечную загрузку" 
-            # и ускоряет работу парсера в 5-10 раз.
-            context.route(
-                "**/*",
-                lambda route, request: route.abort() 
-                if request.resource_type in ("image", "font", "media", "stylesheet") 
-                else route.continue_()
-            )
+            context.route("**/*", lambda route, request: route.abort() 
+                if request.resource_type in ("image", "font", "media", "stylesheet", "websocket") 
+                else route.continue_())
             
             page = context.new_page()
 
             while not stop_event.is_set():
                 try:
+                    # ✅ Блокирующее получение с таймаутом
                     row_id, link = task_q.get(block=True, timeout=1.0)
                 except queue.Empty:
-                    # ✅ Если очередь пуста 1 секунду — проверяем, не пора ли выходить
+                    # Если очередь пуста 1 сек — проверяем, не пора ли выходить
                     if task_q.empty() and stop_event.is_set():
                         break
                     continue
 
                 results = {}
                 
-                # Перехватчик: ловим все API запросы 2GIS
                 def on_response(resp):
                     try:
                         rt = (resp.request.resource_type or "").lower()
                         if rt in ("xhr", "fetch") and "2gis" in resp.url:
                             data = resp.json()
                             self._extract_from_json(data, results)
-                    except Exception:
-                        pass
+                    except: pass
 
                 page.on("response", on_response)
 
-                # В worker_fn, после page.goto():
                 try:
-                    page.goto(link, wait_until="domcontentloaded", timeout=20000)
-                    page.wait_for_timeout(2000)  # Даём время на подгрузку
+                    page.goto(link, wait_until="commit", timeout=10000)  # ✅ Быстрее чем domcontentloaded
+                    page.wait_for_timeout(500)  # ✅ Меньше ожидание
                     
-                    # 1. Сначала пытаемся перехватить API-ответы
-                    def on_response(resp):
-                        try:
-                            rt = (resp.request.resource_type or "").lower()
-                            if rt in ("xhr", "fetch") and "2gis" in resp.url.lower():
-                                data = resp.json()
-                                self._extract_from_json(data, results)
-                        except:
-                            pass
-                    
-                    page.on("response", on_response)
-                    
-                    # 2. Если через API не получилось - парсим initialState из HTML
-                    if not results.get('address') or not results.get('floors'):
-                        html = page.content()
-                        embedded_data = self._parse_initial_state(html)
-                        # Объединяем результаты, приоритет у данных из HTML
-                        for key, value in embedded_data.items():
-                            if value and not results.get(key):
-                                results[key] = value
-                                
-                except PlaywrightTimeoutError:
-                    # Даже при таймауте пробуем распарсить то, что загрузилось
                     html = page.content()
-                    embedded_data = self._parse_initial_state(html)
-                    for key, value in embedded_data.items():
-                        if value and not results.get(key):
-                            results[key] = value
+                    scripts = re.findall(r'<script[^>]*>([\s\S]*?)</script>', html)
+                    for script in scripts:
+                        if '"address_name"' in script or '"ground_count"' in script:
+                            try:
+                                start_idx = script.find('{')
+                                end_idx = script.rfind('}') + 1
+                                if start_idx != -1 and end_idx != 0:
+                                    data = json.loads(script[start_idx:end_idx])
+                                    self._extract_from_json(data, results)
+                            except: pass
+                except PlaywrightTimeoutError:
+                    pass
                 except Exception as e:
                     print(f"Worker {worker_idx} error: {e}")
                 finally:
-                    try:
-                        page.remove_listener("response", on_response)
-                    except:
-                        pass
+                    try: page.remove_listener("response", on_response)
+                    except: pass
 
-                # Запись в базу данных
+                # Запись в БД
                 try:
                     with sqlite3.connect(self.db_path, timeout=30) as conn:
                         cur = conn.cursor()
                         cur.execute("""
                             UPDATE buildings SET 
-                                coordinates=?, latitude=?, longitude=?, address=?, postal_code=?, 
-                                floors=?, ceilings=?, wall_material=?, construction_year=?, 
-                                gas_supply=?, entrances_count=?, processed=1
-                            WHERE id=?
+                                coordinates=?, address=?, postal_code=?, floors=?, ceilings=?, 
+                                wall_material=?, construction_year=?, gas_supply=?, entrances_count=?, 
+                                processed=1 WHERE id=?
                         """, (
-                            results.get('coordinates', ''), 
-                            results.get('latitude', ''),    # НОВОЕ
-                            results.get('longitude', ''),   # НОВОЕ
-                            results.get('address', ''), 
-                            results.get('postcode', ''), 
-                            results.get('floors', ''), 
-                            results.get('ceilings', ''), 
-                            results.get('wall_material', ''), 
-                            results.get('construction_year', ''), 
-                            results.get('gas_supply', ''), 
-                            results.get('entrances_count', ''), 
-                            row_id
+                            results.get('coordinates', ''), results.get('address', ''), 
+                            results.get('postcode', ''), results.get('floors', ''), 
+                            results.get('ceilings', ''), results.get('wall_material', ''), 
+                            results.get('construction_year', ''), results.get('gas_supply', ''), 
+                            results.get('entrances_count', ''), row_id
                         ))
                         conn.commit()
                 except Exception as db_err:
-                    print(f"Ошибка БД: {db_err}")
+                    print(f"DB error: {db_err}")
 
                 pbar.update(1)
-                task_q.task_done()
+                task_q.task_done()  # ✅ Обязательно!
 
-            page.wait_for_load_state("networkidle", timeout=2000)
-            context.close()
-            browser.close()
+            # ✅ Закрываем в правильном порядке с задержками
+            try:
+                page.close()
+                time.sleep(0.2)
+                context.close()
+                time.sleep(0.2)
+                browser.close()
+            except Exception as e:
+                print(f"Worker {worker_idx} close error: {e}")
 
     def run(self):
-        """Основной метод запуска"""
         self.load_links_to_db()
         
-        # Забираем из базы все необработанные ссылки
         with sqlite3.connect(self.db_path) as conn:
             cur = conn.cursor()
             cur.execute("SELECT id, link FROM buildings WHERE processed = 0")
@@ -348,7 +320,7 @@ class Parser2GIS:
 
         total = len(rows)
         if total == 0:
-            print("Все ссылки уже обработаны! Перехожу к экспорту.")
+            print("✅ Все ссылки уже обработаны! Экспортирую...")
             self.export_to_csv()
             return
 
@@ -358,30 +330,28 @@ class Parser2GIS:
 
         stop_event = threading.Event()
         
-        # Корректное завершение по Ctrl+C
         def signal_handler(sig, frame):
-            print("\n⛔ Остановка потоков... Пожалуйста, подождите.")
+            print("\n⛔ Остановка...")
             stop_event.set()
         signal.signal(signal.SIGINT, signal_handler)
 
-        pbar = tqdm(total=total, desc="Обработка ссылок", unit="шт")
+        pbar = tqdm(total=total, desc="Обработка", unit="шт")
         
         threads = []
-        # Запуск рабочих потоков
         for i in range(self.workers):
             t = threading.Thread(target=self.worker_fn, args=(i, task_q, stop_event, pbar))
             t.daemon = True
-            threads.append(t)
             t.start()
+            threads.append(t)
 
-        # ✅ Ждём, пока ВСЕ задачи будут обработаны (task_done() вызван для каждой)
+        # ✅ Ждём, пока ВСЕ задачи будут обработаны
         try:
             task_q.join()  # 🔑 Ключевая строка!
         except KeyboardInterrupt:
             stop_event.set()
-            task_q.join()  # Даём потокам завершиться
+            task_q.join()
 
-        # ✅ Даём потокам время на закрытие браузера
+        # ✅ Даём потокам время на закрытие браузеров
         for t in threads:
             t.join(timeout=5.0)
 
