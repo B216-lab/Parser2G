@@ -44,3 +44,4 @@ data/temp
 *.db
 *.toml
 *.db-journal
+*.db-*

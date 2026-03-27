@@ -48,11 +48,13 @@ class Parser2GIS:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     link TEXT UNIQUE,
                     coordinates TEXT,
+                    latitude TEXT,      -- НОВОЕ
+                    longitude TEXT,     -- НОВОЕ
                     address TEXT,
                     postal_code TEXT,
                     floors TEXT,
                     ceilings TEXT,
-                    wall_material TEXT,
+                    wall_material TEXT, 
                     construction_year TEXT,
                     gas_supply TEXT,
                     entrances_count TEXT,
@@ -60,6 +62,64 @@ class Parser2GIS:
                 )
             ''')
             conn.commit()
+    def _parse_initial_state(self, html: str) -> dict:
+        """Извлекает initialState и ищет подъезды по паттерну"""
+        results = {}
+        
+        # Ищем initialState = JSON.parse('...')
+        patterns = [
+            r'var\s+initialState\s*=\s*JSON\.parse\(\'(.*?)\'\)',
+            r'var\s+initialState\s*=\s*JSON\.parse\("([^"]*)"\)',
+            r'initialState\s*=\s*({.*?});\s*var',
+        ]
+        
+        for pattern in patterns:
+            matches = re.findall(pattern, html, re.DOTALL | re.IGNORECASE)
+            for match in matches:
+                try:
+                    decoded = match.replace('\\"', '"').replace('\\n', '').replace('\\t', '')
+                    data = json.loads(decoded)
+                    self._extract_from_json(data, results)
+                    return results
+                except:
+                    continue
+        
+        # Альтернатива: ищем JSON в скриптах + паттерн подъездов
+        scripts = re.findall(r'<script[^>]*>([\s\S]*?)</script>', html)
+        for script in scripts:
+            # 1. Парсим JSON как раньше
+            if 'initialState' in script or '"address_name"' in script:
+                json_start = script.find('{')
+                if json_start != -1:
+                    brace_count = 0
+                    json_end = -1
+                    for i, char in enumerate(script[json_start:], json_start):
+                        if char == '{':
+                            brace_count += 1
+                        elif char == '}':
+                            brace_count -= 1
+                            if brace_count == 0:
+                                json_end = i + 1
+                                break
+                    if json_end != -1:
+                        try:
+                            json_str = script[json_start:json_end]
+                            json_str = json_str.replace('\\/', '/').replace('\\"', '"')
+                            data = json.loads(json_str)
+                            self._extract_from_json(data, results)
+                        except:
+                            pass
+            
+            # 2. ОТДЕЛЬНО: ищем паттерн подъездов в сыром тексте
+            # Паттерн: {"entity_name":"N подъезд","entity_number":"N",...
+            entrance_pattern = r'\{\s*"entity_name"\s*:\s*"[^"]*подъезд[^"]*"\s*,\s*"entity_number"\s*:\s*"(\d+)"'
+            found_entrances = re.findall(entrance_pattern, script)
+            if found_entrances and not results.get('entrances_count'):
+                # Уникальные номера подъездов
+                unique = list(set(found_entrances))
+                results['entrances_count'] = str(len(unique))
+        
+        return results
 
     def load_links_to_db(self):
         """Загружает ссылки из файла в базу данных (игнорируя дубликаты)"""
@@ -78,47 +138,83 @@ class Parser2GIS:
             
         print(f"Загружено уникальных ссылок в базу: {len(links)}")
 
-    def _extract_from_json(self, obj, results: dict, depth=0):
-        """Рекурсивно ищет нужные ключи в JSON-ответах"""
-        if depth > 20: 
+    def _extract_from_json(self, obj, results: dict, depth=0, path=""):
+        """Рекурсивный поиск с приоритетом полей из профиля здания"""
+        if depth > 25 or obj is None:
             return
             
         if isinstance(obj, dict):
-            if obj.get('address_name') and not results.get('address'):
-                results['address'] = str(obj['address_name'])
-            if obj.get('postcode') and not results.get('postcode'):
-                results['postcode'] = str(obj['postcode'])
-            if isinstance(obj.get('floors'), dict) and 'ground_count' in obj['floors']:
-                results['floors'] = str(obj['floors']['ground_count'])
-            if obj.get('floor_type') and not results.get('ceilings'):
-                results['ceilings'] = str(obj['floor_type'])
-            if obj.get('material') and not results.get('wall_material'):
-                results['wall_material'] = str(obj['material'])
-            if obj.get('year_of_construction') and not results.get('construction_year'):
-                results['construction_year'] = str(obj['year_of_construction'])
-            if obj.get('gas_type') and not results.get('gas_supply'):
-                results['gas_supply'] = str(obj['gas_type'])
-            if isinstance(obj.get('entrances'), list) and not results.get('entrances_count'):
-                results['entrances_count'] = str(len(obj['entrances']))
+            # 🔹 Адрес: приоритет адрес_name из профиля, затем full_name
+            if not results.get('address'):
+                if obj.get('address_name') and 'Иркутск' in str(obj.get('full_name', '')):
+                    results['address'] = str(obj['address_name'])
+                elif obj.get('full_name') and 'квартал' in str(obj['full_name']).lower():
+                    results['address'] = str(obj['full_name'])
             
-            # Координаты
+            # 🔹 Адрес из components (резервный вариант)
+            if not results.get('address') and isinstance(obj.get('address'), dict):
+                addr = obj['address']
+                comps = addr.get('components', [])
+                if comps:
+                    parts = [c.get('street') for c in comps if c.get('street')]
+                    nums = [c.get('number') for c in comps if c.get('number')]
+                    if parts and nums:
+                        results['address'] = f"{parts[0]}, {nums[0]}"
+            
+            # 🔹 Индекс
+            if not results.get('postcode'):
+                if isinstance(obj.get('address'), dict) and obj['address'].get('postcode'):
+                    results['postcode'] = str(obj['address']['postcode'])
+                elif obj.get('postcode'):
+                    results['postcode'] = str(obj['postcode'])
+            
+            # 🔹 Этажность
+            if not results.get('floors') and isinstance(obj.get('floors'), dict):
+                if obj['floors'].get('ground_count'):
+                    results['floors'] = str(obj['floors']['ground_count'])
+            
+            # 🔹 Материал и год
+            if not results.get('wall_material') and obj.get('material'):
+                results['wall_material'] = str(obj['material'])
+            if not results.get('construction_year') and obj.get('year_of_construction'):
+                results['construction_year'] = str(obj['year_of_construction'])
+            if not results.get('gas_supply') and obj.get('gas_type'):
+                results['gas_supply'] = str(obj['gas_type'])
+            
+            # 🔹 Координаты — РАЗДЕЛЬНО!
             if isinstance(obj.get('point'), dict):
-                lat, lon = obj.get('point', {}).get('lat'), obj.get('point', {}).get('lon')
-                if lat and lon and not results.get('coordinates'):
-                    results['coordinates'] = f"{lon}, {lat}"
-                    
-            if isinstance(obj.get('geometry'), dict) and obj['geometry'].get('centroid'):
-                match = re.search(r'POINT\(([-\d.]+)\s+([-\d.]+)\)', obj['geometry']['centroid'])
-                if match and not results.get('coordinates'):
-                    lon, lat = match.groups()
-                    results['coordinates'] = f"{lat}, {lon}"
-
+                lat = obj['point'].get('lat')
+                lon = obj['point'].get('lon')
+                if lat and lon:
+                    results['latitude'] = str(lat)
+                    results['longitude'] = str(lon)
+                    if not results.get('coordinates'):
+                        results['coordinates'] = f"{lon}, {lat}"
+            
+            # 🔹 Подъезды: ищем entity_name с "подъезд"
+            if isinstance(obj.get('database_entrances'), list) and not results.get('entrances_count'):
+                entrances = set()
+                for ent in obj['database_entrances']:
+                    name = ent.get('entity_name', '')
+                    if 'подъезд' in name.lower() and ent.get('is_visible_in_ui', True):
+                        num = ent.get('entity_number')
+                        if num:
+                            entrances.add(num)
+                if entrances:
+                    results['entrances_count'] = str(len(entrances))
+            
+            # 🔹 Рекурсия
             for key, value in obj.items():
-                self._extract_from_json(value, results, depth + 1)
-                
+                new_path = f"{path}.{key}" if path else key
+                # Ищем только в data.profile.<id>.data
+                if 'profile' in new_path and 'data' in new_path:
+                    self._extract_from_json(value, results, depth + 1, new_path)
+                elif not any(x in new_path for x in ['settlements', 'region', 'session']):
+                    self._extract_from_json(value, results, depth + 1, new_path)
+                    
         elif isinstance(obj, list):
             for item in obj:
-                self._extract_from_json(item, results, depth + 1)
+                self._extract_from_json(item, results, depth + 1, path)
 
     def worker_fn(self, worker_idx: int, task_q: queue.Queue, stop_event: threading.Event, pbar):
         """Функция потока: открывает браузер и парсит ссылки"""
@@ -143,9 +239,12 @@ class Parser2GIS:
 
             while not stop_event.is_set():
                 try:
-                    row_id, link = task_q.get(block=False)
+                    row_id, link = task_q.get(block=True, timeout=1.0)
                 except queue.Empty:
-                    break
+                    # ✅ Если очередь пуста 1 секунду — проверяем, не пора ли выходить
+                    if task_q.empty() and stop_event.is_set():
+                        break
+                    continue
 
                 results = {}
                 
@@ -161,32 +260,41 @@ class Parser2GIS:
 
                 page.on("response", on_response)
 
+                # В worker_fn, после page.goto():
                 try:
-                    # Ждем только загрузки DOM, игнорируем тяжелые скрипты
                     page.goto(link, wait_until="domcontentloaded", timeout=20000)
+                    page.wait_for_timeout(2000)  # Даём время на подгрузку
                     
-                    # Даем 2GIS подтянуть данные по сети (XHR)
-                    page.wait_for_timeout(3000) 
+                    # 1. Сначала пытаемся перехватить API-ответы
+                    def on_response(resp):
+                        try:
+                            rt = (resp.request.resource_type or "").lower()
+                            if rt in ("xhr", "fetch") and "2gis" in resp.url.lower():
+                                data = resp.json()
+                                self._extract_from_json(data, results)
+                        except:
+                            pass
                     
-                    # Резервный поиск: вытягиваем NUXT/State прямо из HTML
-                    html = page.content()
-                    scripts = re.findall(r'<script[^>]*>(.*?)</script>', html, re.DOTALL | re.IGNORECASE)
-                    for script in scripts:
-                        if '"address_name"' in script or '"ground_count"' in script:
-                            try:
-                                start_idx = script.find('{')
-                                end_idx = script.rfind('}') + 1
-                                if start_idx != -1 and end_idx != 0:
-                                    data = json.loads(script[start_idx:end_idx])
-                                    self._extract_from_json(data, results)
-                            except:
-                                pass
+                    page.on("response", on_response)
+                    
+                    # 2. Если через API не получилось - парсим initialState из HTML
+                    if not results.get('address') or not results.get('floors'):
+                        html = page.content()
+                        embedded_data = self._parse_initial_state(html)
+                        # Объединяем результаты, приоритет у данных из HTML
+                        for key, value in embedded_data.items():
+                            if value and not results.get(key):
+                                results[key] = value
                                 
                 except PlaywrightTimeoutError:
-                    # Если страница всё-таки повисла, просто идём дальше (данные часто успевают перехватиться)
-                    pass
+                    # Даже при таймауте пробуем распарсить то, что загрузилось
+                    html = page.content()
+                    embedded_data = self._parse_initial_state(html)
+                    for key, value in embedded_data.items():
+                        if value and not results.get(key):
+                            results[key] = value
                 except Exception as e:
-                    pass
+                    print(f"Worker {worker_idx} error: {e}")
                 finally:
                     try:
                         page.remove_listener("response", on_response)
@@ -199,16 +307,23 @@ class Parser2GIS:
                         cur = conn.cursor()
                         cur.execute("""
                             UPDATE buildings SET 
-                            coordinates=?, address=?, postal_code=?, floors=?, ceilings=?, 
-                            wall_material=?, construction_year=?, gas_supply=?, entrances_count=?, 
-                            processed=1
+                                coordinates=?, latitude=?, longitude=?, address=?, postal_code=?, 
+                                floors=?, ceilings=?, wall_material=?, construction_year=?, 
+                                gas_supply=?, entrances_count=?, processed=1
                             WHERE id=?
                         """, (
-                            results.get('coordinates', ''), results.get('address', ''), 
-                            results.get('postcode', ''), results.get('floors', ''), 
-                            results.get('ceilings', ''), results.get('wall_material', ''), 
-                            results.get('construction_year', ''), results.get('gas_supply', ''), 
-                            results.get('entrances_count', ''), row_id
+                            results.get('coordinates', ''), 
+                            results.get('latitude', ''),    # НОВОЕ
+                            results.get('longitude', ''),   # НОВОЕ
+                            results.get('address', ''), 
+                            results.get('postcode', ''), 
+                            results.get('floors', ''), 
+                            results.get('ceilings', ''), 
+                            results.get('wall_material', ''), 
+                            results.get('construction_year', ''), 
+                            results.get('gas_supply', ''), 
+                            results.get('entrances_count', ''), 
+                            row_id
                         ))
                         conn.commit()
                 except Exception as db_err:
@@ -217,6 +332,7 @@ class Parser2GIS:
                 pbar.update(1)
                 task_q.task_done()
 
+            page.wait_for_load_state("networkidle", timeout=2000)
             context.close()
             browser.close()
 
@@ -258,15 +374,16 @@ class Parser2GIS:
             threads.append(t)
             t.start()
 
-        # Ждем завершения
+        # ✅ Ждём, пока ВСЕ задачи будут обработаны (task_done() вызван для каждой)
         try:
-            for t in threads:
-                while t.is_alive():
-                    t.join(timeout=0.5)
-                    if stop_event.is_set():
-                        break
+            task_q.join()  # 🔑 Ключевая строка!
         except KeyboardInterrupt:
             stop_event.set()
+            task_q.join()  # Даём потокам завершиться
+
+        # ✅ Даём потокам время на закрытие браузера
+        for t in threads:
+            t.join(timeout=5.0)
 
         pbar.close()
         
@@ -279,15 +396,18 @@ class Parser2GIS:
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT link, coordinates, address, postal_code, floors, ceilings, 
-                       wall_material, construction_year, gas_supply, entrances_count 
+                SELECT link, coordinates, 
+                    latitude, longitude,  -- новые поля
+                    address, postal_code, floors, ceilings, 
+                    wall_material, construction_year, gas_supply, entrances_count 
                 FROM buildings
             """)
             rows = cursor.fetchall()
 
         headers = [
-            "Ссылка", "Координаты", "Адрес", "Индекс", "Этажность", "Перекрытия", 
-            "Материал стен", "Год постройки", "Газоснабжение", "Кол-во подъездов"
+            "Ссылка", "Координаты", "Широта", "Долгота", "Адрес", "Индекс", 
+            "Этажность", "Перекрытия", "Материал стен", "Год постройки", 
+            "Газоснабжение", "Кол-во подъездов"
         ]
 
         with open(self.results_csv_path, 'w', newline='', encoding='utf-8-sig') as csvfile:
@@ -311,5 +431,5 @@ if __name__ == "__main__":
         sys.exit(1)
         
     # workers=3 оптимально для стабильной работы без бана
-    parser = Parser2GIS(links_file_path, workers=3)
+    parser = Parser2GIS(links_file_path, workers=15)
     parser.run()
