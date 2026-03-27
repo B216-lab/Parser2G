@@ -3,10 +3,13 @@ import json
 import re
 import sqlite3
 import time
+import threading
+import queue
 import signal
 from pathlib import Path
 from urllib.parse import urlparse
 from tqdm import tqdm
+from playwright.sync_api import sync_playwright
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
@@ -627,101 +630,185 @@ class FloorParser:
 
 
 
-    def update_db_with_floor_data(self):
-        # ====== обработка Ctrl+C (graceful stop) ======
-        self._stop_requested = False
-
-        def _signal_handler(signum, frame):
-            print("\n⛔ Получен сигнал остановки. Корректно завершаюсь...")
-            self._stop_requested = True
-
-        signal.signal(signal.SIGINT, _signal_handler)
-        signal.signal(signal.SIGTERM, _signal_handler)
-
-        # ====== считаем ТОЛЬКО необработанные адреса ======
-        conn = sqlite3.connect(self.temp_db_path)
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            SELECT COUNT(*)
+    def update_db_with_floor_data(self, workers: int = 5, headless: bool = False):
+        """
+        Параллельная обработка записей с использованием N браузеров.
+        - workers: количество параллельных браузеров/потоков (по умолчанию 5)
+        - headless: запускать браузеры в headless режиме (по умолчанию True)
+        """
+        # ====== подготовка списка задач (только необработанные записи) ======
+        conn_main = sqlite3.connect(self.temp_db_path)
+        cur_main = conn_main.cursor()
+        cur_main.execute("""
+            SELECT id, dgis_url
             FROM buildings
-            WHERE dgis_url IS NOT NULL
-            AND dgis_url != ''
-            AND floor_count IS NULL
+            WHERE dgis_url IS NOT NULL AND dgis_url != '' AND (floor_count IS NULL)
         """)
-        total = cursor.fetchone()[0]
-        conn.close()
+        rows = cur_main.fetchall()
+        conn_main.close()
 
+        total = len(rows)
         if total == 0:
-            print("✔ Нет адресов для обработки (всё уже собрано)")
+            print("Нет необработанных записей с 2GIS URL.")
             return
 
-        print(f"🔍 Адресов к обработке: {total}")
+        # очередь задач (id, url)
+        task_q = queue.Queue()
+        for r in rows:
+            task_q.put(r)
 
-        # ====== Playwright (один браузер на всё) ======
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=False)
-            context = browser.new_context()
+        # флаги остановки
+        stop_event = threading.Event()
 
-            # ускоряем — блокируем картинки, видео, шрифты
-            context.route(
-                "**/*",
-                lambda route, request: (
-                    route.abort()
-                    if request.resource_type in ("image", "font", "media")
-                    else route.continue_()
-                )
-            )
+        def _signal_handler(sig, frame):
+            print("\n⛔ Получен сигнал остановки — завершаю потоки корректно...")
+            stop_event.set()
 
-            page = context.new_page()
+        # ловим SIGINT / SIGTERM
+        try:
+            signal.signal(signal.SIGINT, _signal_handler)
+            signal.signal(signal.SIGTERM, _signal_handler)
+        except Exception:
+            # в некоторых окружениях сигнал может не поддерживаться
+            pass
+
+        # прогресс-бар (один для всех потоков)
+        pbar = tqdm(total=total, desc="🏢 Обработка зданий", unit="адр", mininterval=0.5, smoothing=0.1)
+
+        # лок для кеша (если ты используешь self._memory_cache — лучше защитить его)
+        cache_lock = threading.Lock()
+
+        # ====== воркер (каждый поток свой браузер/context/page) ======
+        def worker_fn(worker_idx: int):
+            conn = None
+            browser = None
+            context = None
+            page = None
+            p = None
 
             try:
-                conn = sqlite3.connect(self.temp_db_path)
-                cursor = conn.cursor()
+                p = sync_playwright().start()
+                browser = p.chromium.launch(headless=headless)
+                context = browser.new_context()
+                # ускорение: блокировать тяжелые ресурсы
+                try:
+                    context.route(
+                        "**/*",
+                        lambda route, request: (
+                            route.abort()
+                            if request.resource_type in ("image", "font", "media")
+                            else route.continue_()
+                        )
+                    )
+                except Exception:
+                    pass
+                page = context.new_page()
 
-                cursor.execute("""
-                    SELECT id, dgis_url
-                    FROM buildings
-                    WHERE dgis_url IS NOT NULL
-                    AND dgis_url != ''
-                    AND floor_count IS NULL
-                """)
-                rows = cursor.fetchall()
-
-                for row_id, dgis_url in tqdm(
-                    rows,
-                    total=total,
-                    desc="🏢 Сбор этажности",
-                    unit="адр",
-                    mininterval=1.0
-                ):
-                    if self._stop_requested:
-                        break
+                while not stop_event.is_set():
+                    try:
+                        row_id, dgis_url = task_q.get(block=False)
+                    except queue.Empty:
+                        break  # всё сделано
 
                     try:
-                        result = self.process_building_url(page, dgis_url)
-                    except Exception as e:
-                        print(f"\n⚠ Ошибка при обработке {dgis_url}: {e}")
                         result = None
+                        try:
+                            result = self.process_building_url(page, dgis_url)
+                        except Exception as e_proc:
+                            print(f"\n[worker {worker_idx}] Ошибка при обработке {dgis_url}: {e_proc}")
 
-                    if result and "floor_count" in result:
-                        cursor.execute(
-                            "UPDATE buildings SET floor_count = ? WHERE id = ?",
-                            (result["floor_count"], row_id)
-                        )
+                        if result and "floor_count" in result:
+                            try:
+                                conn = sqlite3.connect(self.temp_db_path, timeout=30)
+                                cur = conn.cursor()
+                                cur.execute(
+                                    "UPDATE buildings SET floor_count = ?, \"Количество_этажей\" = ? WHERE id = ?",
+                                    (result["floor_count"], result["floor_count"], row_id)
+                                )
+                                conn.commit()
+                                conn.close()
+                            except Exception as e_db:
+                                print(f"[worker {worker_idx}] Ошибка записи в БД для id={row_id}: {e_db}")
 
-                    # сохраняем после КАЖДОГО адреса — для resume
-                    conn.commit()
+                            # обновляем in-memory кэш под lock, если нужно
+                            try:
+                                with cache_lock:
+                                    m = re.search(r"/geo/(\d+)", dgis_url)
+                                    if m:
+                                        bid = m.group(1)
+                                        try:
+                                            self.set_cached_floor(bid, int(result["floor_count"]))
+                                        except Exception:
+                                            pass
+                            except Exception:
+                                pass
 
-                    # небольшая пауза (не обязательно, но полезно)
-                    time.sleep(0.2)
+                        # обновляем прогресс (вне lock — tqdm потокобезопасен)
+                        pbar.update(1)
 
-                conn.close()
+                        # лёгкая пауза между задачами
+                        time.sleep(0.05)
+                    finally:
+                        try:
+                            task_q.task_done()
+                        except Exception:
+                            pass
 
+            except Exception as e_main:
+                print(f"[worker {worker_idx}] критическая ошибка: {e_main}")
             finally:
-                browser.close()
+                try:
+                    if page:
+                        page.close()
+                except Exception:
+                    pass
+                try:
+                    if context:
+                        context.close()
+                except Exception:
+                    pass
+                try:
+                    if browser:
+                        browser.close()
+                except Exception:
+                    pass
+                try:
+                    if p:
+                        p.stop()
+                except Exception:
+                    pass
 
-        print("✅ update_db_with_floor_data завершена")
+        # ====== стартуем потоки ======
+        threads = []
+        for i in range(max(1, int(workers))):
+            t = threading.Thread(target=worker_fn, args=(i+1,), daemon=True)
+            threads.append(t)
+            t.start()
+
+        # ждём завершения всех задач или стопа
+        try:
+            for t in threads:
+                while t.is_alive():
+                    t.join(timeout=0.5)
+                    if stop_event.is_set():
+                        break
+        except KeyboardInterrupt:
+            stop_event.set()
+
+        # дождёмся пустой очереди (безошибочное завершение)
+        try:
+            task_q.join(timeout=1)
+        except Exception:
+            pass
+
+        pbar.close()
+
+        if stop_event.is_set():
+            print("Процесс прерван пользователем. Чтобы продолжить, запустите скрипт снова — обработка возобновится с необработанных записей.")
+        else:
+            print("Все задания обработаны.")
+
+
 
 
     def export_to_csv(self):

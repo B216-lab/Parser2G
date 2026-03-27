@@ -23,6 +23,9 @@ venv/
 
 parser_2gis/
 
+*.cs*
+*.qmd
+
 data/
 data/temp
 !data/.gitkeep
