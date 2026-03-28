@@ -7,9 +7,25 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
+from dataclasses import dataclass
 from tqdm import tqdm
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+
+@dataclass
+class BuildingData:
+    """Структура для хранения данных здания"""
+    link: str
+    coordinates: str = ""
+    address: str = ""
+    postal_code: str = ""
+    floors: str = ""
+    ceilings: str = ""
+    wall_material: str = ""
+    construction_year: str = ""
+    gas_supply: str = ""
+    entrances_count: str = ""
+    building_type: str = ""
 
 class Parser2GIS:
     def __init__(self, links_file: str, workers: int = 3):
@@ -118,11 +134,12 @@ class Parser2GIS:
         print(f"Загружено уникальных ссылок в базу: {len(links)}")
 
     def _extract_from_json(self, obj, results: dict, depth=0, path=""):
-        """Рекурсивный поиск данных"""
+        """Рекурсивный поиск с приоритетом полей из профиля здания"""
         if depth > 25 or obj is None:
             return
             
         if isinstance(obj, dict):
+            # Адрес
             if not results.get('address'):
                 if obj.get('address_name') and 'Иркутск' in str(obj.get('full_name', '')):
                     results['address'] = str(obj['address_name'])
@@ -138,27 +155,31 @@ class Parser2GIS:
                     if parts and nums:
                         results['address'] = f"{parts[0]}, {nums[0]}"
             
+            # Индекс
             if not results.get('postcode'):
                 if isinstance(obj.get('address'), dict) and obj['address'].get('postcode'):
                     results['postcode'] = str(obj['address']['postcode'])
                 elif obj.get('postcode'):
                     results['postcode'] = str(obj['postcode'])
             
+            # Этажность
             if not results.get('floors') and isinstance(obj.get('floors'), dict):
                 if obj['floors'].get('ground_count'):
                     results['floors'] = str(obj['floors']['ground_count'])
             
+            # Материалы и газ
             if not results.get('wall_material') and obj.get('material'):
                 results['wall_material'] = str(obj['material'])
             if not results.get('construction_year') and obj.get('year_of_construction'):
                 results['construction_year'] = str(obj['year_of_construction'])
             if not results.get('gas_supply') and obj.get('gas_type'):
                 results['gas_supply'] = str(obj['gas_type'])
-                
-            # ИЗВЛЕЧЕНИЕ ТИПА ЗДАНИЯ
+            
+            # Тип здания
             if not results.get('building_type') and obj.get('purpose_name'):
                 results['building_type'] = str(obj['purpose_name'])
             
+            # Координаты
             if isinstance(obj.get('point'), dict):
                 lat = obj['point'].get('lat')
                 lon = obj['point'].get('lon')
@@ -168,6 +189,7 @@ class Parser2GIS:
                     if not results.get('coordinates'):
                         results['coordinates'] = f"{lon}, {lat}"
             
+            # Подъезды
             if isinstance(obj.get('database_entrances'), list) and not results.get('entrances_count'):
                 entrances = set()
                 for ent in obj['database_entrances']:
@@ -179,6 +201,7 @@ class Parser2GIS:
                 if entrances:
                     results['entrances_count'] = str(len(entrances))
             
+            # Рекурсия
             for key, value in obj.items():
                 new_path = f"{path}.{key}" if path else key
                 if 'profile' in new_path and 'data' in new_path:
@@ -191,118 +214,142 @@ class Parser2GIS:
                 self._extract_from_json(item, results, depth + 1, path)
 
     def worker_fn(self, worker_idx: int, task_q: queue.Queue, stop_event: threading.Event, pbar):
-        try:
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled"])
-                context = browser.new_context(
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                    viewport={"width": 1920, "height": 1080}
-                )
-                
-                context.route(
-                    "**/*",
-                    lambda route, request: route.abort() 
-                    if request.resource_type in ("image", "font", "media", "stylesheet") 
-                    else route.continue_()
-                )
-                
-                page = context.new_page()
+        """Рабочий поток с изоляцией Playwright"""
+        p = sync_playwright().start()
+        browser = None
+        context = None
+        page = None
+        requests_count = 0
 
-                while not stop_event.is_set():
-                    try:
-                        row_id, link = task_q.get(block=True, timeout=1.0)
-                    except queue.Empty:
-                        if stop_event.is_set():
-                            break
-                        continue
+        def init_browser():
+            nonlocal browser, context, page
+            if browser:
+                try: browser.close()
+                except: pass
+            browser = p.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled"])
+            context = browser.new_context(viewport={"width": 1920, "height": 1080})
+            context.route(
+                "**/*", 
+                lambda route, request: route.abort() 
+                if request.resource_type in ("image", "font", "media", "stylesheet") 
+                else route.continue_()
+            )
+            page = context.new_page()
 
-                    results = {}
+        init_browser()
+
+        while not stop_event.is_set():
+            try:
+                row_id, link = task_q.get(timeout=1.0)
+            except queue.Empty:
+                if task_q.empty() or stop_event.is_set():
+                    break
+                continue
+
+            # Перезапуск браузера для очистки памяти
+            if requests_count > 150:
+                init_browser()
+                requests_count = 0
+
+            results = {}
+            data_found = False
+
+            def on_response(resp):
+                nonlocal data_found
+                try:
+                    rt = (resp.request.resource_type or "").lower()
+                    if rt in ("xhr", "fetch") and "2gis" in resp.url.lower():
+                        data = resp.json()
+                        self._extract_from_json(data, results)
+                        # Если нашли ключевые данные, ставим флаг для быстрого выхода
+                        if results.get('address') and results.get('floors'):
+                            data_found = True
+                except:
+                    pass
+
+            try:
+                page.on("response", on_response)
+                
+                try:
+                    page.goto(link, wait_until="domcontentloaded", timeout=15000)
                     
-                    try:
-                        def on_response(resp):
-                            try:
-                                rt = (resp.request.resource_type or "").lower()
-                                if rt in ("xhr", "fetch") and "2gis" in resp.url.lower():
-                                    data = resp.json()
-                                    self._extract_from_json(data, results)
-                            except:
-                                pass
+                    # Быстрый поллинг вместо жесткого слипа
+                    for _ in range(25):  # Ждем максимум 2.5 секунды
+                        if data_found: 
+                            break
+                        page.wait_for_timeout(100)
                         
-                        page.on("response", on_response)
-                        
+                    # Если данных все еще нет, вытаскиваем из HTML
+                    if not results.get('address') or not results.get('floors'):
+                        html = ""
                         try:
-                            page.goto(link, wait_until="domcontentloaded", timeout=20000)
-                            page.wait_for_timeout(2000) 
-                            
-                            if not results.get('address') or not results.get('floors'):
-                                html = page.content()
-                                embedded_data = self._parse_initial_state(html)
-                                for key, value in embedded_data.items():
-                                    if value and not results.get(key):
-                                        results[key] = value
-                                        
-                        except PlaywrightTimeoutError:
                             html = page.content()
-                            embedded_data = self._parse_initial_state(html)
-                            for key, value in embedded_data.items():
-                                if value and not results.get(key):
-                                    results[key] = value
                         except Exception as e:
-                            if "TargetClosedError" not in str(e):
-                                print(f"Worker {worker_idx} navigation error: {e}")
-                        finally:
-                            try:
-                                page.remove_listener("response", on_response)
-                            except:
-                                pass
+                            # Обход ошибки навигации
+                            if "navigating" in str(e).lower() or "target closed" in str(e).lower():
+                                page.wait_for_timeout(1500)
+                                try: html = page.content()
+                                except: pass
+                                
+                        if html:
+                            embedded_data = self._parse_initial_state(html)
+                            for k, v in embedded_data.items():
+                                if v and not results.get(k):
+                                    results[k] = v
+                                    
+                except PlaywrightTimeoutError:
+                    pass # Игнорируем таймауты навигации, идем сохранять что есть
+                except Exception as e:
+                    if "TargetClosedError" not in str(e):
+                        pass
+            finally:
+                try: page.remove_listener("response", on_response)
+                except: pass
 
-                        # Запись в базу
-                        with sqlite3.connect(self.db_path, timeout=30) as conn:
-                            cur = conn.cursor()
-                            cur.execute("""
-                                UPDATE buildings SET 
-                                    coordinates=?, latitude=?, longitude=?, address=?, postal_code=?, 
-                                    floors=?, ceilings=?, wall_material=?, construction_year=?, 
-                                    gas_supply=?, entrances_count=?, building_type=?, processed=1
-                                WHERE id=?
-                            """, (
-                                results.get('coordinates', ''), 
-                                results.get('latitude', ''),
-                                results.get('longitude', ''),
-                                results.get('address', ''), 
-                                results.get('postcode', ''), 
-                                results.get('floors', ''), 
-                                results.get('ceilings', ''), 
-                                results.get('wall_material', ''), 
-                                results.get('construction_year', ''), 
-                                results.get('gas_supply', ''), 
-                                results.get('entrances_count', ''), 
-                                results.get('building_type', ''), 
-                                row_id
-                            ))
-                            conn.commit()
-
-                    except Exception as e:
-                        if "TargetClosedError" not in str(e):
-                            print(f"Worker {worker_idx} error: {e}")
-                    finally:
-                        # ГАРАНТИРУЕТ, что счетчик обновится и задача закроется, даже если была ошибка
-                        pbar.update(1)
-                        task_q.task_done()
-
-                context.close()
-                browser.close()
-                
-        except Exception as e:
-            # Игнорируем ошибку закрытия браузера при прерывании
-            if "TargetClosedError" not in str(e):
+            # Сохранение результатов в БД
+            try:
+                with sqlite3.connect(self.db_path, timeout=30) as conn:
+                    conn.execute("""
+                        UPDATE buildings SET 
+                            coordinates=?, latitude=?, longitude=?, address=?, postal_code=?, 
+                            floors=?, ceilings=?, wall_material=?, construction_year=?, 
+                            gas_supply=?, entrances_count=?, building_type=?, processed=1
+                        WHERE id=?
+                    """, (
+                        results.get('coordinates', ''), results.get('latitude', ''), results.get('longitude', ''),
+                        results.get('address', ''), results.get('postcode', ''), results.get('floors', ''), 
+                        results.get('ceilings', ''), results.get('wall_material', ''), results.get('construction_year', ''), 
+                        results.get('gas_supply', ''), results.get('entrances_count', ''), results.get('building_type', ''), 
+                        row_id
+                    ))
+                    conn.commit()
+            except Exception:
                 pass
+
+            pbar.update(1)
+            requests_count += 1
+            task_q.task_done()
+
+        if browser:
+            try: browser.close()
+            except: pass
+        p.stop()
 
     def run(self):
         self.load_links_to_db()
         
+        # 1. Защита от пустых записей: сбрасываем статус, если адрес и координаты пустые
         with sqlite3.connect(self.db_path) as conn:
             cur = conn.cursor()
+            cur.execute("""
+                UPDATE buildings 
+                SET processed = 0 
+                WHERE processed = 1 
+                  AND (address IS NULL OR address = '') 
+                  AND (coordinates IS NULL OR coordinates = '')
+            """)
+            conn.commit()
+
             cur.execute("SELECT id, link FROM buildings WHERE processed = 0")
             rows = cur.fetchall()
 
@@ -319,34 +366,31 @@ class Parser2GIS:
         stop_event = threading.Event()
         
         def signal_handler(sig, frame):
-            print("\n⛔ Получен сигнал остановки. Завершаем потоки и сохраняем данные...")
+            print("\n⛔ Сигнал прерывания. Мягкая остановка потоков (сохранение прогресса)...")
             stop_event.set()
             
         signal.signal(signal.SIGINT, signal_handler)
 
         pbar = tqdm(total=total, desc="Обработка ссылок", unit="шт")
-        
         threads = []
+        
         for i in range(self.workers):
             t = threading.Thread(target=self.worker_fn, args=(i, task_q, stop_event, pbar))
             t.daemon = True
             threads.append(t)
             t.start()
 
-        # Мягкое ожидание завершения работы потоков
         try:
             while not task_q.empty() and not stop_event.is_set():
                 time.sleep(0.5)
-            # Ждем завершения последних активных задач, если скрипт не прерван
             if not stop_event.is_set():
                 task_q.join()
         except KeyboardInterrupt:
             stop_event.set()
-            print("\n⛔ Остановка потоков...")
+            print("\n⛔ Остановка...")
 
-        # Даем потокам пару секунд на корректное закрытие браузеров
         for t in threads:
-            t.join(timeout=2.0)
+            t.join(timeout=3.0)
 
         pbar.close()
         self.export_to_csv()
@@ -381,7 +425,7 @@ if __name__ == "__main__":
     import sys
     
     if len(sys.argv) != 2:
-        print("Использование: python script.py <файл_со_ссылками.txt>")
+        print("Использование: python main_parser.py <файл_со_ссылками.txt>")
         sys.exit(1)
         
     links_file_path = sys.argv[1]
