@@ -25,10 +25,12 @@ class BuildingData:
     construction_year: str = ""
     gas_supply: str = ""
     entrances_count: str = ""
+    apartments_count: str = ""  # НОВОЕ: Количество квартир
     building_type: str = ""
 
+
 class Parser2GIS:
-    def __init__(self, links_file: str, workers: int = 3):
+    def __init__(self, links_file: str, workers: int = 5):
         self.links_file = Path(links_file)
         self.output_dir = Path("output")
         self.output_dir.mkdir(exist_ok=True)
@@ -39,32 +41,65 @@ class Parser2GIS:
         self._init_db()
 
     def _init_db(self):
-        """Создает таблицы и включает режим WAL для многопоточности"""
+        """Создает таблицы. ДОБАВЛЕНА КОЛОНКА apartments_count"""
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute('''
-                CREATE TABLE IF NOT EXISTS buildings (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    link TEXT UNIQUE,
-                    coordinates TEXT,
-                    latitude TEXT,
-                    longitude TEXT,
-                    address TEXT,
-                    postal_code TEXT,
-                    floors TEXT,
-                    ceilings TEXT,
-                    wall_material TEXT, 
-                    construction_year TEXT,
-                    gas_supply TEXT,
-                    entrances_count TEXT,
-                    building_type TEXT,
-                    processed INTEGER DEFAULT 0
-                )
-            ''')
+            # Используем ALTER TABLE для обновления старой БД без её удаления, если она есть
+            try:
+                conn.execute('''
+                    CREATE TABLE IF NOT EXISTS buildings (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        link TEXT UNIQUE,
+                        coordinates TEXT,
+                        latitude TEXT,
+                        longitude TEXT,
+                        address TEXT,
+                        postal_code TEXT,
+                        floors TEXT,
+                        ceilings TEXT,
+                        wall_material TEXT, 
+                        construction_year TEXT,
+                        gas_supply TEXT,
+                        entrances_count TEXT,
+                        apartments_count TEXT,
+                        building_type TEXT,
+                        processed INTEGER DEFAULT 0
+                    )
+                ''')
+            except sqlite3.OperationalError:
+                pass
+                
+            # Если база старая и там нет колонки apartments_count, добавляем её на лету
+            try:
+                conn.execute("ALTER TABLE buildings ADD COLUMN apartments_count TEXT")
+            except sqlite3.OperationalError:
+                pass # Колонка уже существует
+                
             conn.commit()
 
+    def _extract_apartments(self, text: str) -> str:
+        """Ищет паттерны 'квартиры X–Y' и суммирует их количество"""
+        total_apartments = 0
+        # Ищем совпадения с учетом разных тире (минус, короткое тире, длинное тире)
+        matches = re.findall(r'квартиры\s*(\d+)\s*[-–—]\s*(\d+)', text.lower())
+        
+        if not matches:
+            return ""
+            
+        # Убираем дубликаты, чтобы не посчитать одни и те же квартиры дважды
+        unique_matches = set(matches)
+        for start_str, end_str in unique_matches:
+            try:
+                start, end = int(start_str), int(end_str)
+                if end >= start:
+                    total_apartments += (end - start + 1)
+            except ValueError:
+                pass
+                
+        return str(total_apartments) if total_apartments > 0 else ""
+
     def _parse_initial_state(self, html: str) -> dict:
-        """Извлекает initialState и ищет подъезды по паттерну"""
+        """Извлекает initialState и ищет подъезды/квартиры по паттерну в HTML"""
         results = {}
         
         patterns = [
@@ -80,44 +115,26 @@ class Parser2GIS:
                     decoded = match.replace('\\"', '"').replace('\\n', '').replace('\\t', '')
                     data = json.loads(decoded)
                     self._extract_from_json(data, results)
-                    return results
                 except:
                     continue
         
         scripts = re.findall(r'<script[^>]*>([\s\S]*?)</script>', html)
         for script in scripts:
-            if 'initialState' in script or '"address_name"' in script:
-                json_start = script.find('{')
-                if json_start != -1:
-                    brace_count = 0
-                    json_end = -1
-                    for i, char in enumerate(script[json_start:], json_start):
-                        if char == '{':
-                            brace_count += 1
-                        elif char == '}':
-                            brace_count -= 1
-                            if brace_count == 0:
-                                json_end = i + 1
-                                break
-                    if json_end != -1:
-                        try:
-                            json_str = script[json_start:json_end]
-                            json_str = json_str.replace('\\/', '/').replace('\\"', '"')
-                            data = json.loads(json_str)
-                            self._extract_from_json(data, results)
-                        except:
-                            pass
-            
             entrance_pattern = r'\{\s*"entity_name"\s*:\s*"[^"]*подъезд[^"]*"\s*,\s*"entity_number"\s*:\s*"(\d+)"'
             found_entrances = re.findall(entrance_pattern, script)
             if found_entrances and not results.get('entrances_count'):
                 unique = list(set(found_entrances))
                 results['entrances_count'] = str(len(unique))
-        
+
+        # Ищем квартиры в сыром HTML
+        apts = self._extract_apartments(html)
+        if apts:
+            results['apartments_count'] = apts
+            
         return results
 
     def load_links_to_db(self):
-        """Загружает ссылки из файла в базу данных"""
+        """Загружает ссылки из файла в БД"""
         links = []
         with open(self.links_file, 'r', encoding='utf-8') as f:
             for line in f:
@@ -131,7 +148,7 @@ class Parser2GIS:
                 cur.execute("INSERT OR IGNORE INTO buildings (link) VALUES (?)", (link,))
             conn.commit()
             
-        print(f"Загружено уникальных ссылок в базу: {len(links)}")
+        print(f"Загружено ссылок в базу: {len(links)}")
 
     def _extract_from_json(self, obj, results: dict, depth=0, path=""):
         """Рекурсивный поиск с приоритетом полей из профиля здания"""
@@ -175,8 +192,8 @@ class Parser2GIS:
             if not results.get('gas_supply') and obj.get('gas_type'):
                 results['gas_supply'] = str(obj['gas_type'])
             
-            # Тип здания
-            if not results.get('building_type') and obj.get('purpose_name'):
+            # ИСПРАВЛЕНИЕ ТИПА ЗДАНИЯ: Строго проверяем, что это здание, а не пристройка
+            if obj.get('type') == 'building' and obj.get('purpose_name') and not results.get('building_type'):
                 results['building_type'] = str(obj['purpose_name'])
             
             # Координаты
@@ -214,7 +231,6 @@ class Parser2GIS:
                 self._extract_from_json(item, results, depth + 1, path)
 
     def worker_fn(self, worker_idx: int, task_q: queue.Queue, stop_event: threading.Event, pbar):
-        """Рабочий поток с изоляцией Playwright"""
         p = sync_playwright().start()
         browser = None
         context = None
@@ -226,7 +242,11 @@ class Parser2GIS:
             if browser:
                 try: browser.close()
                 except: pass
-            browser = p.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled"])
+            
+            browser = p.chromium.launch(
+                headless=False, 
+                args=["--disable-blink-features=AutomationControlled", "--disable-dev-shm-usage", "--no-sandbox"]
+            )
             context = browser.new_context(viewport={"width": 1920, "height": 1080})
             context.route(
                 "**/*", 
@@ -246,24 +266,25 @@ class Parser2GIS:
                     break
                 continue
 
-            # Перезапуск браузера для очистки памяти
             if requests_count > 150:
                 init_browser()
                 requests_count = 0
 
             results = {}
-            data_found = False
 
             def on_response(resp):
-                nonlocal data_found
                 try:
                     rt = (resp.request.resource_type or "").lower()
                     if rt in ("xhr", "fetch") and "2gis" in resp.url.lower():
                         data = resp.json()
                         self._extract_from_json(data, results)
-                        # Если нашли ключевые данные, ставим флаг для быстрого выхода
-                        if results.get('address') and results.get('floors'):
-                            data_found = True
+                        
+                        # Если данные содержат текст с квартирами, вытаскиваем их прямо из JSON-строки
+                        json_str = json.dumps(data, ensure_ascii=False)
+                        if "квартиры" in json_str.lower():
+                            apts = self._extract_apartments(json_str)
+                            if apts and not results.get('apartments_count'):
+                                results['apartments_count'] = apts
                 except:
                     pass
 
@@ -273,54 +294,53 @@ class Parser2GIS:
                 try:
                     page.goto(link, wait_until="domcontentloaded", timeout=15000)
                     
-                    # Быстрый поллинг вместо жесткого слипа
-                    for _ in range(25):  # Ждем максимум 2.5 секунды
-                        if data_found: 
+                    # Динамическое ожидание данных
+                    for _ in range(25):
+                        if results.get('address') and results.get('floors') and results.get('building_type'):
                             break
                         page.wait_for_timeout(100)
                         
-                    # Если данных все еще нет, вытаскиваем из HTML
-                    if not results.get('address') or not results.get('floors'):
-                        html = ""
-                        try:
-                            html = page.content()
-                        except Exception as e:
-                            # Обход ошибки навигации
-                            if "navigating" in str(e).lower() or "target closed" in str(e).lower():
-                                page.wait_for_timeout(1500)
-                                try: html = page.content()
-                                except: pass
+                    # Финальная выгрузка из HTML на случай, если API не отдало всё
+                    html = ""
+                    try:
+                        html = page.content()
+                    except Exception as e:
+                        if "navigating" in str(e).lower() or "target closed" in str(e).lower():
+                            pass
+                            
+                    if html:
+                        embedded_data = self._parse_initial_state(html)
+                        for k, v in embedded_data.items():
+                            if v and not results.get(k):
+                                results[k] = v
                                 
-                        if html:
-                            embedded_data = self._parse_initial_state(html)
-                            for k, v in embedded_data.items():
-                                if v and not results.get(k):
-                                    results[k] = v
-                                    
                 except PlaywrightTimeoutError:
-                    pass # Игнорируем таймауты навигации, идем сохранять что есть
+                    pass
+                
                 except Exception as e:
-                    if "TargetClosedError" not in str(e):
-                        pass
+                    err_str = str(e).lower()
+                    if "target closed" in err_str or "browser" in err_str or "disconnected" in err_str:
+                        init_browser()
+                        requests_count = 0
+                        
             finally:
                 try: page.remove_listener("response", on_response)
                 except: pass
 
-            # Сохранение результатов в БД
             try:
                 with sqlite3.connect(self.db_path, timeout=30) as conn:
                     conn.execute("""
                         UPDATE buildings SET 
                             coordinates=?, latitude=?, longitude=?, address=?, postal_code=?, 
                             floors=?, ceilings=?, wall_material=?, construction_year=?, 
-                            gas_supply=?, entrances_count=?, building_type=?, processed=1
+                            gas_supply=?, entrances_count=?, apartments_count=?, building_type=?, processed=1
                         WHERE id=?
                     """, (
                         results.get('coordinates', ''), results.get('latitude', ''), results.get('longitude', ''),
                         results.get('address', ''), results.get('postcode', ''), results.get('floors', ''), 
                         results.get('ceilings', ''), results.get('wall_material', ''), results.get('construction_year', ''), 
-                        results.get('gas_supply', ''), results.get('entrances_count', ''), results.get('building_type', ''), 
-                        row_id
+                        results.get('gas_supply', ''), results.get('entrances_count', ''), results.get('apartments_count', ''),
+                        results.get('building_type', ''), row_id
                     ))
                     conn.commit()
             except Exception:
@@ -338,9 +358,9 @@ class Parser2GIS:
     def run(self):
         self.load_links_to_db()
         
-        # 1. Защита от пустых записей: сбрасываем статус, если адрес и координаты пустые
         with sqlite3.connect(self.db_path) as conn:
             cur = conn.cursor()
+            # Сбрасываем прогресс для пустых записей
             cur.execute("""
                 UPDATE buildings 
                 SET processed = 0 
@@ -355,7 +375,7 @@ class Parser2GIS:
 
         total = len(rows)
         if total == 0:
-            print("Все ссылки уже обработаны! Перехожу к экспорту.")
+            print("Все ссылки обработаны! Перехожу к экспорту.")
             self.export_to_csv()
             return
 
@@ -366,7 +386,7 @@ class Parser2GIS:
         stop_event = threading.Event()
         
         def signal_handler(sig, frame):
-            print("\n⛔ Сигнал прерывания. Мягкая остановка потоков (сохранение прогресса)...")
+            print("\n⛔ Остановка. Сохраняю прогресс...")
             stop_event.set()
             
         signal.signal(signal.SIGINT, signal_handler)
@@ -402,7 +422,7 @@ class Parser2GIS:
             cursor.execute("""
                 SELECT link, coordinates, latitude, longitude, address, postal_code, 
                        floors, ceilings, wall_material, construction_year, 
-                       gas_supply, entrances_count, building_type 
+                       gas_supply, entrances_count, apartments_count, building_type 
                 FROM buildings
             """)
             rows = cursor.fetchall()
@@ -410,7 +430,7 @@ class Parser2GIS:
         headers = [
             "Ссылка", "Координаты", "Широта", "Долгота", "Адрес", "Индекс", 
             "Этажность", "Перекрытия", "Материал стен", "Год постройки", 
-            "Газоснабжение", "Кол-во подъездов", "Тип здания"
+            "Газоснабжение", "Кол-во подъездов", "Кол-во квартир", "Тип здания"
         ]
 
         with open(self.results_csv_path, 'w', newline='', encoding='utf-8-sig') as csvfile:
@@ -433,5 +453,6 @@ if __name__ == "__main__":
         print(f"❌ Файл {links_file_path} не найден!")
         sys.exit(1)
         
-    parser = Parser2GIS(links_file_path, workers=20)
+    # Запускаем в 10 потоков
+    parser = Parser2GIS(links_file_path, workers=5)
     parser.run()
